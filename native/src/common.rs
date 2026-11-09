@@ -155,13 +155,152 @@ pub fn fingerprint(value: &str) -> Result<()> {
 fn cname(value: &OsStr) -> Result<CString> {
     CString::new(value.as_bytes()).map_err(|_| path_error())
 }
+/// True when anyone besides the owner can modify the object through its mode.
+/// Linux permits group write only for the current user's sole-member primary
+/// group, freshly verified against complete local account files and files-only
+/// NSS configuration. Other systems keep the strict 022 rule.
+#[cfg(unix)]
+pub fn foreign_writable(mode: u32, gid: u32) -> bool {
+    mode & 0o002 != 0 || (mode & 0o020 != 0 && !private_group(gid))
+}
+#[cfg(target_os = "linux")]
+fn private_group(gid: u32) -> bool {
+    let (uid, primary) = unsafe { (libc::getuid(), libc::getgid()) };
+    if gid != primary {
+        return false;
+    }
+    // Do not use the ordinary permission checker here: it calls private_group.
+    let read = |path: &str, limit: u64| -> Option<String> {
+        let name = cname(OsStr::new(path)).ok()?;
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let info = file.metadata().ok()?;
+        if !info.is_file() || info.uid() != 0 || info.mode() & 0o022 != 0
+            || info.nlink() != 1 || info.len() > limit
+        {
+            return None;
+        }
+        let mut text = String::new();
+        file.take(limit + 1).read_to_string(&mut text).ok()?;
+        (text.len() as u64 <= limit).then_some(text)
+    };
+    let Some(nsswitch) = read("/etc/nsswitch.conf", 65536) else { return false };
+    if !files_only_accounts(&nsswitch) {
+        return false;
+    }
+    let Some(passwd) = read("/etc/passwd", 4 << 20) else { return false };
+    let Some(group) = read("/etc/group", 4 << 20) else { return false };
+    user_private_group(&passwd, &group, uid, primary)
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn private_group(_gid: u32) -> bool {
+    false
+}
+#[cfg(target_os = "linux")]
+fn files_only_accounts(nsswitch: &str) -> bool {
+    let (mut passwd, mut group) = (false, false);
+    for line in nsswitch.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        if !line.is_ascii() || line.contains('\\') || line.bytes().any(|b| b.is_ascii_control() && b != b'\t' && b != b'\r') {
+            return false;
+        }
+        let line = line.trim_ascii();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((database, sources)) = line.split_once(':') else { return false };
+        let seen = match database.trim_ascii() {
+            "passwd" => &mut passwd,
+            "group" => &mut group,
+            _ => continue,
+        };
+        let mut sources = sources.split_ascii_whitespace();
+        if *seen || sources.next() != Some("files") || sources.next().is_some() {
+            return false;
+        }
+        *seen = true;
+    }
+    passwd && group
+}
+/// Complete, unambiguous account records must identify exactly one account
+/// with primary group `gid`, owned by `uid`, and no other group members.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn user_private_group(passwd: &str, group: &str, uid: u32, gid: u32) -> bool {
+    let valid_name = |name: &str| {
+        !name.is_empty() && !name.starts_with(['+', '-'])
+            && !name.chars().any(|c| c.is_whitespace() || c == ',' || c == ':')
+    };
+    let id = |value: &str| -> Option<u32> {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        value.parse::<u32>().ok().filter(|value| *value != u32::MAX)
+    };
+    let mut names = HashSet::new();
+    let mut ids = HashSet::new();
+    let mut name = None;
+    for line in passwd.lines().filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let mut fields = line.split(':');
+        let record: [Option<&str>; 7] = std::array::from_fn(|_| fields.next());
+        let [Some(entry_name), Some(_), Some(entry_uid), Some(entry_gid), Some(_), Some(_), Some(_)] = record else {
+            return false;
+        };
+        let (Some(entry_uid), Some(entry_gid)) = (id(entry_uid), id(entry_gid)) else { return false };
+        if fields.next().is_some() || line.bytes().any(|b| b.is_ascii_control())
+            || !valid_name(entry_name) || !names.insert(entry_name) || !ids.insert(entry_uid)
+        {
+            return false;
+        }
+        if entry_gid == gid {
+            if entry_uid != uid || name.is_some() {
+                return false;
+            }
+            name = Some(entry_name);
+        }
+    }
+    let Some(name) = name else { return false };
+    names.clear();
+    ids.clear();
+    let mut members = HashSet::new();
+    let mut defined = false;
+    for line in group.lines().filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let mut fields = line.split(':');
+        let record: [Option<&str>; 4] = std::array::from_fn(|_| fields.next());
+        let [Some(entry_name), Some(_), Some(entry_gid), Some(entry_members)] = record else { return false };
+        let Some(entry_gid) = id(entry_gid) else { return false };
+        if fields.next().is_some() || line.bytes().any(|b| b.is_ascii_control())
+            || !valid_name(entry_name) || !names.insert(entry_name) || !ids.insert(entry_gid)
+        {
+            return false;
+        }
+        members.clear();
+        if !entry_members.is_empty() && entry_members.split(',').any(|member| !valid_name(member) || !members.insert(member)) {
+            return false;
+        }
+        if entry_gid == gid {
+            if !(entry_members.is_empty() || entry_members == name) {
+                return false;
+            }
+            defined = true;
+        }
+    }
+    defined
+}
 #[cfg(unix)]
 fn check_directory(file: &File, leaf_private: bool) -> Result<()> {
     let info = file.metadata().map_err(|_| path_error())?;
     let uid = unsafe { libc::geteuid() };
     if !info.is_dir()
         || (info.uid() != 0 && info.uid() != uid)
-        || (info.mode() & 0o022 != 0
+        || (foreign_writable(info.mode(), info.gid())
             && !(info.uid() == 0 && info.mode() & (libc::S_ISVTX as u32) != 0))
         || (leaf_private && (info.uid() != uid || info.mode() & 0o777 != 0o700))
     {
@@ -238,7 +377,7 @@ fn check_file(file: &File, private: bool, limit: u64) -> Result<()> {
     if !info.is_file()
         || info.uid() != unsafe { libc::geteuid() }
         || info.nlink() != 1
-        || info.mode() & 0o022 != 0
+        || foreign_writable(info.mode(), info.gid())
         || (private && info.mode() & 0o777 != 0o600)
         || info.len() > limit
     {
@@ -861,6 +1000,26 @@ mod tests {
     #[test]
     fn shell_quotes_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+    #[test]
+    fn group_write_is_trusted_only_for_a_sole_member_private_group() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000::/home/alice:/bin/sh\nbob:x:1001:1001::/home/bob:/bin/sh\n";
+        let group = "root:x:0:\nalice:x:1000:\nbob:x:1001:\nstaff:x:50:alice,bob\nsolo:x:60:alice\n";
+        assert!(user_private_group(passwd, group, 1000, 1000));
+        // Another account's private group, or a shared group, still lets others write.
+        assert!(!user_private_group(passwd, group, 1000, 1001));
+        assert!(!user_private_group(passwd, group, 1000, 50));
+        // No account has it as its primary group (typical setgid groups).
+        assert!(!user_private_group(passwd, group, 1000, 60));
+        // A second account sharing the primary group, or a listed second member.
+        let shared = format!("{passwd}carol:x:1002:1000::/home/carol:/bin/sh\n");
+        assert!(!user_private_group(&shared, group, 1000, 1000));
+        assert!(!user_private_group(passwd, "alice:x:1000:carol\n", 1000, 1000));
+        assert!(user_private_group(passwd, "alice:x:1000:alice\n", 1000, 1000));
+        // Duplicate or malformed group definitions fail closed.
+        assert!(!user_private_group(passwd, "alice:x:1000:\nalias:x:1000:\n", 1000, 1000));
+        assert!(!user_private_group(passwd, "alice:x:1000\n", 1000, 1000));
+        assert!(!user_private_group(passwd, "", 1000, 1000));
     }
     #[test]
     fn duplicate_security_decisions_are_rejected() {
