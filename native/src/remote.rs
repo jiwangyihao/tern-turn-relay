@@ -479,7 +479,6 @@ pub(crate) mod linux {
         cancel: &mut dyn FnMut(Option<Instant>) -> Result<()>,
     ) -> Result<()> {
         interrupted()?;
-        if Instant::now() >= deadline { return Err(failure("identity_mismatch")); }
         cancel(Some(deadline))?;
         if Instant::now() >= deadline { return Err(failure("identity_mismatch")); }
         Ok(())
