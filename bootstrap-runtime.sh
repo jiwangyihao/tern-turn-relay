@@ -254,7 +254,7 @@ case "$m_perm" in 400|600|444|644|664) ;; *) fail 'Native release manifest is wr
 ! foreign_writable "$m_perm" "$m_gid" || fail 'Native release manifest is writable by another user'
 [ "$m_size" -le 65536 ] || fail 'Native release manifest exceeds its limit'
 version=$(field version) || fail 'Invalid native release manifest'
-[ "$version" = 0.5.12 ] || fail 'Native release version does not match the plugin'
+[ "$version" = 0.5.13 ] || fail 'Native release version does not match the plugin'
 [ "$(field schema)" = 1 ] || fail 'Unsupported native release manifest'
 asset=tern-turn-relay-$platform-$arch
 sha256=$(field "assets.$asset.sha256") || fail 'Native asset checksum is missing'
