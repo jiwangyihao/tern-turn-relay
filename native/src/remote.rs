@@ -1486,6 +1486,9 @@ pub(crate) mod linux {
             return Err(failure("identity_mismatch"));
         }
         pin.check(true)?;
+        if pin.record() != new {
+            return Err(failure("identity_mismatch"));
+        }
         let review = json!({"version":1,"state_dir":directory,"request":request,"old_identity":old,"new_identity":new,"gateway_fingerprint":gateway_fingerprint,"identity_files":{"gateway":gateway_files,"original":original_files},"backup_path":rebind_backup(directory, old)?});
         Ok((review, pin))
     }
@@ -1569,6 +1572,9 @@ pub(crate) mod linux {
                 return Err(failure("identity_mismatch"));
             }
             pin.check(true)?;
+            if pin.record() != review["new_identity"] {
+                return Err(failure("identity_mismatch"));
+            }
             common::atomic_json(&directory.join("daemon-identity.json"), &review["new_identity"])
                 .map_err(|_| failure("security_error"))?;
         }
