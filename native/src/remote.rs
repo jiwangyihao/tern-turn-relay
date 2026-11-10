@@ -94,7 +94,7 @@ pub(crate) mod linux {
             fd::{AsRawFd, FromRawFd, OwnedFd},
             unix::{
                 ffi::OsStrExt,
-                fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+                fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt},
                 process::CommandExt,
             },
         },
@@ -411,11 +411,170 @@ pub(crate) mod linux {
         Ok((credentials.pid as u32, credentials.uid))
     }
     const UPDATE_WAIT: Duration = Duration::from_secs(8);
+    // Bound both individual files and cumulative IO during one pending update.
+    // A current Tern is ~197 MiB. Never allocate or seek a whole executable.
+    const EXECUTABLE_MAX: u64 = 256 * 1024 * 1024;
+    const COMPARISON_BYTES: u64 = 2 * EXECUTABLE_MAX;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct ExecutableStamp {
+        device: u64,
+        inode: u64,
+        length: u64,
+        mtime: (i64, i64),
+        ctime: (i64, i64),
+        permissions: (u32, u32, u32),
+        links: u64,
+    }
+    impl ExecutableStamp {
+        fn new(info: &Metadata) -> Self {
+            Self {
+                device: info.dev(),
+                inode: info.ino(),
+                length: info.len(),
+                mtime: (info.mtime(), info.mtime_nsec()),
+                ctime: (info.ctime(), info.ctime_nsec()),
+                permissions: (info.uid(), info.gid(), info.mode()),
+                links: info.nlink(),
+            }
+        }
+        fn read(file: &File) -> Result<Self> {
+            file.metadata().map(|info| Self::new(&info))
+                .map_err(|_| failure("identity_mismatch"))
+        }
+    }
+    struct ExecutableComparison {
+        // Keep the installation object open, including negative results, so an
+        // unlinked object's inode cannot be reused to hit this cache.
+        installed: File,
+        running_stamp: ExecutableStamp,
+        installed_stamp: ExecutableStamp,
+        equal: bool,
+    }
+    fn installed_executable(binary: &Path) -> Result<File> {
+        ancestors(binary.parent().ok_or_else(|| failure("security_error"))?)?;
+        let file = OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(binary).map_err(|_| failure("identity_mismatch"))?;
+        let info = file.metadata().map_err(|_| failure("identity_mismatch"))?;
+        executable_metadata(&info)?;
+        if info.nlink() != 1 { return Err(failure("security_error")); }
+        let name = CString::new(binary.as_os_str().as_bytes())
+            .map_err(|_| failure("security_error"))?;
+        if unsafe { libc::access(name.as_ptr(), libc::X_OK) } != 0 {
+            return Err(failure("security_error"));
+        }
+        Ok(file)
+    }
+    fn installed_unchanged(binary: &Path, expected: ExecutableStamp) -> Result<()> {
+        ancestors(binary.parent().ok_or_else(|| failure("security_error"))?)?;
+        let info = fs::symlink_metadata(binary).map_err(|_| failure("identity_mismatch"))?;
+        executable_metadata(&info)?;
+        if ExecutableStamp::new(&info) != expected {
+            return Err(failure("identity_mismatch"));
+        }
+        Ok(())
+    }
+    fn comparison_checkpoint(
+        deadline: Instant,
+        cancel: &mut dyn FnMut(Option<Instant>) -> Result<()>,
+    ) -> Result<()> {
+        interrupted()?;
+        if Instant::now() >= deadline { return Err(failure("identity_mismatch")); }
+        cancel(Some(deadline))?;
+        if Instant::now() >= deadline { return Err(failure("identity_mismatch")); }
+        Ok(())
+    }
+    fn read_executable_chunk(
+        file: &File,
+        bytes: &mut [u8],
+        offset: u64,
+        remaining: &mut u64,
+        deadline: Instant,
+        cancel: &mut dyn FnMut(Option<Instant>) -> Result<()>,
+    ) -> Result<()> {
+        let mut done = 0;
+        while done < bytes.len() {
+            comparison_checkpoint(deadline, cancel)?;
+            let wanted = bytes.len() - done;
+            if *remaining < wanted as u64 { return Err(failure("identity_mismatch")); }
+            match file.read_at(&mut bytes[done..], offset + done as u64) {
+                Ok(0) => return Err(failure("identity_mismatch")),
+                Ok(count) => {
+                    *remaining -= count as u64;
+                    done += count;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
+                Err(_) => return Err(failure("identity_mismatch")),
+            }
+        }
+        Ok(())
+    }
+    fn equivalent_installation(
+        running: &File,
+        expected: ExecutableStamp,
+        binary: &Path,
+        cache: &mut Option<ExecutableComparison>,
+        remaining: &mut u64,
+        deadline: Instant,
+        cancel: &mut dyn FnMut(Option<Instant>) -> Result<()>,
+    ) -> Result<bool> {
+        comparison_checkpoint(deadline, cancel)?;
+        let installed = installed_executable(binary)?;
+        let installed_stamp = ExecutableStamp::read(&installed)?;
+        if ExecutableStamp::read(running)? != expected {
+            return Err(failure("identity_mismatch"));
+        }
+        if installed_stamp.permissions != expected.permissions || expected.links > 1 {
+            return Err(failure("security_error"));
+        }
+        installed_unchanged(binary, installed_stamp)?;
+        if let Some(previous) = cache {
+            if previous.running_stamp == expected
+                && previous.installed_stamp == installed_stamp
+                && ExecutableStamp::read(&previous.installed)? == installed_stamp
+            {
+                return Ok(previous.equal);
+            }
+        }
+        *cache = None;
+        let mut equal = expected.length == installed_stamp.length
+            && expected.length > 0 && expected.length <= EXECUTABLE_MAX;
+        if equal {
+            let mut left = [0u8; 64 * 1024];
+            let mut right = [0u8; 64 * 1024];
+            let mut offset = 0;
+            while offset < expected.length {
+                let count = (expected.length - offset).min(left.len() as u64) as usize;
+                read_executable_chunk(running, &mut left[..count], offset, remaining, deadline, cancel)?;
+                read_executable_chunk(&installed, &mut right[..count], offset, remaining, deadline, cancel)?;
+                if left[..count] != right[..count] {
+                    equal = false;
+                    break;
+                }
+                offset += count as u64;
+            }
+        }
+        comparison_checkpoint(deadline, cancel)?;
+        if ExecutableStamp::read(running)? != expected
+            || ExecutableStamp::read(&installed)? != installed_stamp
+        {
+            return Err(failure("identity_mismatch"));
+        }
+        installed_unchanged(binary, installed_stamp)?;
+        *cache = Some(ExecutableComparison {
+            installed, running_stamp: expected, installed_stamp, equal,
+        });
+        Ok(equal)
+    }
     struct ExecutablePin {
         file: File,
         identity: Value,
         permissions: (u32, u32, u32),
         deadline: Option<Instant>,
+        comparison: Option<ExecutableComparison>,
+        comparison_bytes: u64,
+        // Explicit rebind review is a frozen observation, not a migration.
+        reviewed: Option<ExecutableStamp>,
     }
     pub(crate) struct DaemonPin {
         pub(crate) path: PathBuf,
@@ -445,6 +604,9 @@ pub(crate) mod linux {
                     identity: identity.clone(),
                     permissions: (executable_info.uid(), executable_info.gid(), executable_info.mode()),
                     deadline: None,
+                    comparison: None,
+                    comparison_bytes: COMPARISON_BYTES,
+                    reviewed: None,
                 }),
                 identity,
                 pid,
@@ -472,6 +634,8 @@ pub(crate) mod linux {
             // Untrusted observations constrain waiting only; they never become
             // an authenticated DaemonPin or supply an executable command path.
             let mut waiting: Option<(File, Value, Metadata, Metadata)> = None;
+            let mut comparison = None;
+            let mut comparison_bytes = COMPARISON_BYTES;
             loop {
                 interrupted()?;
                 if let Some(control) = control.as_deref_mut() { control.startup()?; }
@@ -538,7 +702,8 @@ pub(crate) mod linux {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
                     Err(_) => return Err(failure("security_error")),
                 }
-                let mut current = identity_at(pid, &socket_path, &binary)?;
+                let observed = identity_at(pid, &socket_path, &binary)?;
+                let mut current = observed.clone();
                 current["version"] = json!(2);
                 current["daemon_socket"] = json!(socket);
                 current["socket_device"] = json!(socket_info.dev());
@@ -553,10 +718,49 @@ pub(crate) mod linux {
                     {
                         return Err(failure("identity_mismatch"));
                     }
-                } else {
-                    waiting = Some((file, current, info, socket_info));
                 }
                 let end = *deadline.get_or_insert_with(|| Instant::now() + UPDATE_WAIT);
+                // Unlike exec migration, equivalence grants no argv relaxation.
+                // A complete existing v2 binding and the original gateway are
+                // prerequisites; an old filename alone never authenticates.
+                if current == *saved && fs::symlink_metadata(&binary).is_ok()
+                    && equivalent_installation(
+                        &file, ExecutableStamp::new(&info), &binary, &mut comparison,
+                        &mut comparison_bytes, end, &mut |_| {
+                            if let Some(control) = control.as_deref_mut() { control.startup()?; }
+                            Ok(())
+                        },
+                    )?
+                {
+                    let pin = Self {
+                        executable: RefCell::new(ExecutablePin {
+                            file,
+                            identity: observed.clone(),
+                            permissions: (info.uid(), info.gid(), info.mode()),
+                            deadline: None,
+                            comparison,
+                            comparison_bytes: COMPARISON_BYTES,
+                            reviewed: None,
+                        }),
+                        identity: observed,
+                        pid,
+                        path: socket_path,
+                        socket: (socket_info.dev(), socket_info.ino()),
+                        socket_permissions: (socket_info.uid(), socket_info.gid(), socket_info.mode()),
+                        gateway_identity,
+                    };
+                    // Recheck process/peer/argv/socket/certificates after the
+                    // byte comparison, then retain the full persistence gate.
+                    pin.wait_ready(control.as_deref_mut())?;
+                    if rebind_pin(directory)? != *saved || pin.record() != *saved {
+                        return Err(failure("identity_mismatch"));
+                    }
+                    pin.persist(directory, control.as_deref_mut())?;
+                    return Ok(pin);
+                }
+                if waiting.is_none() {
+                    waiting = Some((file, current, info, socket_info));
+                }
                 if Instant::now() >= end { return Err(failure("identity_mismatch")); }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -586,16 +790,22 @@ pub(crate) mod linux {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(_) => return Err(failure("security_error")),
             };
-            Ok(held.deadline.is_none()
-                && (running.dev(), running.ino()) == (previous.dev(), previous.ino())
-                && (installed.dev(), installed.ino()) == (previous.dev(), previous.ino())
+            let continuous = (running.dev(), running.ino()) == (previous.dev(), previous.ino())
                 && (running.uid(), running.gid(), running.mode()) == held.permissions
                 && (previous.uid(), previous.gid(), previous.mode()) == held.permissions
                 && (installed.uid(), installed.gid(), installed.mode()) == held.permissions
                 && executable_metadata(&running).is_ok()
                 && executable_metadata(&previous).is_ok()
-                && executable_metadata(&installed).is_ok()
-                && executable_name(&file)? == binary)
+                && executable_metadata(&installed).is_ok();
+            let canonical = (installed.dev(), installed.ino()) == (previous.dev(), previous.ino())
+                && executable_name(&file)? == binary;
+            let equivalent = held.comparison.as_ref().is_some_and(|comparison| {
+                comparison.equal
+                    && comparison.running_stamp == ExecutableStamp::new(&running)
+                    && comparison.running_stamp == ExecutableStamp::new(&previous)
+                    && comparison.installed_stamp == ExecutableStamp::new(&installed)
+            });
+            Ok(held.deadline.is_none() && continuous && (canonical || equivalent))
         }
         fn check_gateway_identity(&self) -> Result<()> {
             if let Some((directory, expected)) = &self.gateway_identity {
@@ -608,6 +818,15 @@ pub(crate) mod linux {
         }
         // false is an authenticated file-object transition, never an ignored error.
         fn observe(&self, responsive: bool) -> Result<bool> {
+            self.observe_with(responsive, &mut |_| interrupted())
+        }
+        fn observe_with(
+            &self,
+            responsive: bool,
+            cancel: &mut dyn FnMut(Option<Instant>) -> Result<()>,
+        ) -> Result<bool> {
+            let deadline = self.executable.borrow().deadline;
+            cancel(deadline)?;
             self.check_gateway_identity()?;
             let mut held = self.executable.borrow_mut();
             let binary = Path::new(self.identity["executable_path"].as_str()
@@ -636,25 +855,49 @@ pub(crate) mod linux {
             if name.parent() != binary.parent() {
                 return Err(failure("identity_mismatch"));
             }
+            if held.reviewed.is_some_and(|stamp| {
+                stamp != ExecutableStamp::new(&running)
+                    || stamp != ExecutableStamp::new(&previous)
+                    || current != held.identity
+            }) {
+                return Err(failure("identity_mismatch"));
+            }
             ancestors(binary.parent().ok_or_else(|| failure("security_error"))?)?;
             let installed = match fs::symlink_metadata(binary) {
-                Ok(info) => { executable_metadata(&info)?; Some((info.dev(), info.ino())) }
+                Ok(info) => { executable_metadata(&info)?; Some(info) }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(_) => return Err(failure("security_error")),
             };
-            if name != binary || installed != Some((running.dev(), running.ino())) {
+            if held.reviewed.is_some_and(|stamp| {
+                installed.as_ref().is_none_or(|info| ExecutableStamp::new(info) != stamp)
+            }) {
+                return Err(failure("identity_mismatch"));
+            }
+            let canonical = name == binary && installed.as_ref()
+                .is_some_and(|info| (info.dev(), info.ino()) == (running.dev(), running.ino()));
+            let mut equivalent = false;
+            if !canonical {
                 if !same || current != held.identity || peer(&self.path)? != (self.pid, uid()) {
                     return Err(failure("identity_mismatch"));
                 }
                 let deadline = *held.deadline.get_or_insert_with(|| Instant::now() + UPDATE_WAIT);
                 if Instant::now() >= deadline { return Err(failure("identity_mismatch")); }
-                return Ok(false);
+                if installed.is_some() && self.gateway_identity.is_some() {
+                    let ExecutablePin { file, comparison, comparison_bytes, .. } = &mut *held;
+                    equivalent = equivalent_installation(
+                        file, ExecutableStamp::new(&previous), binary, comparison,
+                        comparison_bytes, deadline, cancel,
+                    )?;
+                } else {
+                    held.comparison = None;
+                }
+                if !equivalent { return Ok(false); }
             }
             if held.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(failure("identity_mismatch"));
             }
             // A rename back is not completion: require exec of a different file.
-            if held.deadline.is_some() && same {
+            if held.deadline.is_some() && same && !equivalent {
                 if current != held.identity || peer(&self.path)? != (self.pid, uid()) {
                     return Err(failure("identity_mismatch"));
                 }
@@ -665,8 +908,8 @@ pub(crate) mod linux {
             } else {
                 compatible_rebind_argv(&current, &held.identity)?;
             }
-            if verified_executable(&file)? != binary
-                || ((responsive || !same) && peer(&self.path)? != (self.pid, uid()))
+            if (!equivalent && verified_executable(&file)? != binary)
+                || ((responsive || !same || equivalent) && peer(&self.path)? != (self.pid, uid()))
                 || identity_at(self.pid, &self.path, binary)? != current
             {
                 return Err(failure("identity_mismatch"));
@@ -674,27 +917,42 @@ pub(crate) mod linux {
             let latest = running_executable(self.pid)?.metadata()
                 .map_err(|_| failure("identity_mismatch"))?;
             let socket = socket_metadata(&self.path)?;
-            if (latest.dev(), latest.ino()) != (running.dev(), running.ino())
-                || (latest.uid(), latest.gid(), latest.mode()) != (running.uid(), running.gid(), running.mode())
+            if ExecutableStamp::new(&latest) != ExecutableStamp::new(&running)
+                || ExecutableStamp::read(&held.file)? != ExecutableStamp::new(&previous)
                 || (socket.dev(), socket.ino()) != self.socket
                 || (socket.uid(), socket.gid(), socket.mode()) != self.socket_permissions
             {
                 return Err(failure("identity_mismatch"));
             }
+            if equivalent {
+                let comparison = held.comparison.as_ref().ok_or_else(|| failure("identity_mismatch"))?;
+                if ExecutableStamp::read(&comparison.installed)? != comparison.installed_stamp {
+                    return Err(failure("identity_mismatch"));
+                }
+                installed_unchanged(binary, comparison.installed_stamp)?;
+            } else if let Some(installed) = &installed {
+                installed_unchanged(binary, ExecutableStamp::new(installed))?;
+            }
+            cancel(held.deadline)?;
             self.check_gateway_identity()?;
             if !same {
                 held.file = file;
                 held.identity = current;
                 held.permissions = (running.uid(), running.gid(), running.mode());
+                held.comparison = None;
             }
             held.deadline = None;
+            held.comparison_bytes = COMPARISON_BYTES;
             Ok(true)
         }
         fn wait_ready(&self, mut control: Option<&mut Control>) -> Result<()> {
             loop {
                 interrupted()?;
                 if let Some(control) = control.as_deref_mut() { control.startup()?; }
-                if self.observe(true)? { return Ok(()); }
+                if self.observe_with(true, &mut |_| {
+                    if let Some(control) = control.as_deref_mut() { control.startup()?; }
+                    Ok(())
+                })? { return Ok(()); }
                 thread::sleep(Duration::from_millis(50));
             }
         }
@@ -703,7 +961,7 @@ pub(crate) mod linux {
             let deadline = Instant::now() + UPDATE_WAIT;
             loop {
                 control.startup()?;
-                let ready = self.observe(true)?;
+                let ready = self.observe_with(true, &mut |_| control.startup())?;
                 if ready && (self.executable_object()? != previous || Instant::now() >= deadline) {
                     return Err(failure("frontend_exit"));
                 }
@@ -821,11 +1079,35 @@ pub(crate) mod linux {
         }
         fn command(&self, control: Option<&mut Control>) -> Result<Command> {
             self.wait_ready(control)?;
-            let mut command = Command::new(
-                self.identity["executable_path"]
-                    .as_str()
-                    .ok_or_else(|| failure("identity_mismatch"))?,
-            );
+            let binary = Path::new(self.identity["executable_path"].as_str()
+                .ok_or_else(|| failure("identity_mismatch"))?);
+            let installed = installed_executable(binary)?;
+            let stamp = ExecutableStamp::read(&installed)?;
+            let held = self.executable.borrow();
+            let running = ExecutableStamp::read(&held.file)?;
+            let equivalent = held.comparison.as_ref().is_some_and(|comparison| {
+                comparison.equal && comparison.running_stamp == running
+                    && comparison.installed_stamp == stamp
+            });
+            if stamp != running && !equivalent {
+                return Err(failure("identity_mismatch"));
+            }
+            installed_unchanged(binary, stamp)?;
+            // exec resolves this retained CLOEXEC descriptor, not a mutable
+            // installation path. argv[0] remains the canonical Tern path.
+            // The closure owns the FD through spawn; exec closes it in the
+            // child, and dropping Command closes the parent's copy.
+            let mut command = Command::new(format!("/proc/self/fd/{}", installed.as_raw_fd()));
+            command.arg0(binary);
+            unsafe {
+                command.pre_exec(move || {
+                    let info = installed.metadata()?;
+                    if ExecutableStamp::new(&info) != stamp {
+                        return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                    }
+                    Ok(())
+                });
+            }
             command
                 .env("TERN_DAEMON_SOCKET", &self.path)
                 .env("TERN_PANE_SOCKET", &self.path);
@@ -1021,9 +1303,83 @@ pub(crate) mod linux {
                 thread::sleep(Duration::from_millis(20));
             }
         }
+        fn poll_messages(&mut self) -> Result<Vec<Value>> {
+            loop {
+                interrupted()?;
+                let mut fd = libc::pollfd {
+                    fd: self.fd,
+                    events: libc::POLLIN | libc::POLLRDHUP,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut fd, 1, 0) } >= 0 {
+                    return self.receive_ready(fd.revents);
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return Err(failure("control_eof"));
+                }
+            }
+        }
+        fn serving(
+            &mut self,
+            heartbeat: &mut Instant,
+            comparison_deadline: Option<Instant>,
+        ) -> Result<bool> {
+            // One absolute output budget for the entire callback, capped by
+            // the comparison's original deadline, never a fresh 5s per pong.
+            let send_deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = comparison_deadline.map_or(send_deadline, |end| end.min(send_deadline));
+            const PONG: &[u8] = b"{\"ok\":true,\"op\":\"pong\"}\n";
+            let mut pending = 0usize;
+            let mut offset = 0;
+            loop {
+                // Poll again before every write, including partial writes and
+                // the next buffered reply. Stop/HUP must preempt backpressure.
+                let messages = self.poll_messages()?;
+                if messages.iter().any(|message| *message == json!({"op":"stop"})) {
+                    return Ok(false);
+                }
+                for message in messages {
+                    if message != json!({"op":"ping"}) {
+                        return Err(failure("protocol_error"));
+                    }
+                    pending = pending.checked_add(1).ok_or_else(|| failure("protocol_error"))?;
+                    *heartbeat = Instant::now();
+                }
+                if heartbeat.elapsed() > Duration::from_secs(45) {
+                    return Err(failure("heartbeat_timeout"));
+                }
+                if Instant::now() >= deadline {
+                    return Err(failure(if comparison_deadline.is_some_and(|end| Instant::now() >= end) {
+                        "identity_mismatch"
+                    } else {
+                        "send_timeout"
+                    }));
+                }
+                if pending == 0 { return Ok(true); }
+                let count = unsafe {
+                    libc::write(libc::STDOUT_FILENO, PONG[offset..].as_ptr().cast(), PONG.len() - offset)
+                };
+                if count > 0 {
+                    offset += count as usize;
+                    if offset == PONG.len() {
+                        pending -= 1;
+                        offset = 0;
+                    }
+                    continue;
+                }
+                if count == 0 { return Err(failure("control_eof")); }
+                match std::io::Error::last_os_error().kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => (),
+                    _ => return Err(failure("control_eof")),
+                }
+                thread::sleep(Duration::from_millis(10)
+                    .min(deadline.saturating_duration_since(Instant::now())));
+            }
+        }
         fn startup(&mut self) -> Result<()> {
             interrupted()?;
-            let messages = self.receive()?;
+            let messages = self.poll_messages()?;
             if messages.iter().any(|message| *message == json!({"op":"stop"})) {
                 return Err(failure("control_eof"));
             }
@@ -1460,6 +1816,8 @@ pub(crate) mod linux {
         let socket = request["daemon_socket"].as_str().unwrap();
         validate_rebind_record(old, socket)?;
         let pin = DaemonPin::new(socket)?;
+        let reviewed = ExecutableStamp::read(&pin.executable.borrow().file)?;
+        pin.executable.borrow_mut().reviewed = Some(reviewed);
         let new = pin.record();
         validate_rebind_record(&new, socket)?;
         if old == &new || old["executable_path"] != new["executable_path"] {
@@ -1489,7 +1847,12 @@ pub(crate) mod linux {
         if pin.record() != new {
             return Err(failure("identity_mismatch"));
         }
-        let review = json!({"version":1,"state_dir":directory,"request":request,"old_identity":old,"new_identity":new,"gateway_fingerprint":gateway_fingerprint,"identity_files":{"gateway":gateway_files,"original":original_files},"backup_path":rebind_backup(directory, old)?});
+        let executable = json!({
+            "device":reviewed.device,"inode":reviewed.inode,"length":reviewed.length,
+            "mtime":reviewed.mtime,"ctime":reviewed.ctime,
+            "permissions":reviewed.permissions,"links":reviewed.links,
+        });
+        let review = json!({"version":1,"state_dir":directory,"request":request,"old_identity":old,"new_identity":new,"gateway_fingerprint":gateway_fingerprint,"identity_files":{"gateway":gateway_files,"original":original_files,"executable":executable},"backup_path":rebind_backup(directory, old)?});
         Ok((review, pin))
     }
     pub(crate) fn rebind_review(directory: &str, request: &Value) -> Result<Value> {
@@ -1902,18 +2265,7 @@ pub(crate) mod linux {
                 return Err(failure("unknown"));
             }
             // Terminal control events win over buffered pings and all UDP data.
-            if fds[0].revents != 0 {
-                for message in control.receive_ready(fds[0].revents)? {
-                    if message == json!({"op":"stop"}) {
-                        return Ok(());
-                    }
-                    if message != json!({"op":"ping"}) {
-                        return Err(failure("protocol_error"));
-                    }
-                    heartbeat = Instant::now();
-                    emit(&json!({"ok":true,"op":"pong"}))?;
-                }
-            }
+            if !control.serving(&mut heartbeat, None)? { return Ok(()); }
             let now = Instant::now();
             let data_ready = fds[1..].iter().any(|fd| fd.revents & libc::POLLIN != 0);
             let executable_changed = ready && frontend_exit.is_none() && data_ready
@@ -1923,7 +2275,16 @@ pub(crate) mod linux {
             // frontend exit is observed, the paused loop checks every 50–300 ms.
             if frontend_exit.is_some() || !ready || now.duration_since(check) >= Duration::from_secs(1) {
                 let responsive = now.duration_since(probe) >= Duration::from_secs(5);
-                ready = prepared.pin.observe(responsive)?;
+                let mut stopped = false;
+                let observed = prepared.pin.observe_with(responsive, &mut |deadline| {
+                    if !control.serving(&mut heartbeat, deadline)? {
+                        stopped = true;
+                        return Err(failure("control_eof"));
+                    }
+                    Ok(())
+                });
+                if stopped { return Ok(()); }
+                ready = observed?;
                 if responsive { probe = now; }
                 check = now;
                 flows.expire(now);
