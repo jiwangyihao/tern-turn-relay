@@ -84,6 +84,7 @@ pub(crate) mod linux {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde_json::json;
     use std::{
+        cell::RefCell,
         collections::{BTreeMap, BTreeSet},
         ffi::{CStr, CString},
         fs::{self, File, Metadata, OpenOptions},
@@ -248,10 +249,26 @@ pub(crate) mod linux {
             Ok(())
         }
     }
+    fn running_executable(pid: u32) -> Result<File> {
+        File::open(format!("/proc/{pid}/exe")).map_err(|_| failure("identity_mismatch"))
+    }
+    fn executable_name(file: &File) -> Result<PathBuf> {
+        let info = file.metadata().map_err(|_| failure("identity_mismatch"))?;
+        let raw = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|_| failure("identity_mismatch"))?;
+        let raw = raw.to_str().ok_or_else(|| failure("identity_mismatch"))?;
+        // This only describes an open object, never authenticates an old name.
+        let raw = if let Some(name) = raw.strip_suffix(" (deleted)") {
+            if info.nlink() != 0 { return Err(failure("identity_mismatch")); }
+            name
+        } else { raw };
+        path(raw)
+    }
     pub(crate) fn executable(pid: u32) -> Result<PathBuf> {
+        verified_executable(&running_executable(pid)?)
+    }
+    fn verified_executable(file: &File) -> Result<PathBuf> {
         // A single open file description binds path and metadata through exec.
-        let file =
-            File::open(format!("/proc/{pid}/exe")).map_err(|_| failure("identity_mismatch"))?;
         let running = file.metadata().map_err(|_| failure("identity_mismatch"))?;
         let raw = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .map_err(|_| failure("identity_mismatch"))?;
@@ -283,7 +300,7 @@ pub(crate) mod linux {
             })
             .collect()
     }
-    fn identity(pid: u32, socket: &Path) -> Result<Value> {
+    fn identity_at(pid: u32, socket: &Path, binary: &Path) -> Result<Value> {
         if fs::metadata(format!("/proc/{pid}"))
             .map_err(|_| failure("identity_mismatch"))?
             .uid()
@@ -292,7 +309,7 @@ pub(crate) mod linux {
             return Err(failure("identity_mismatch"));
         }
         let (start, _) = process_stat(pid)?;
-        let binary = executable(pid)?;
+        // The caller must independently authenticate the running executable.
         let args = command_line(pid)?;
         if args.is_empty()
             || (args[0] != "tern" && Path::new(&args[0]) != binary)
@@ -393,11 +410,21 @@ pub(crate) mod linux {
         }
         Ok((credentials.pid as u32, credentials.uid))
     }
+    const UPDATE_WAIT: Duration = Duration::from_secs(8);
+    struct ExecutablePin {
+        file: File,
+        identity: Value,
+        permissions: (u32, u32, u32),
+        deadline: Option<Instant>,
+    }
     pub(crate) struct DaemonPin {
         pub(crate) path: PathBuf,
         pub(crate) pid: u32,
         pub(crate) identity: Value,
         socket: (u64, u64),
+        socket_permissions: (u32, u32, u32),
+        executable: RefCell<ExecutablePin>,
+        gateway_identity: Option<(PathBuf, (Value, Vec<[u8; 32]>))>,
     }
     impl DaemonPin {
         pub(crate) fn new(text: &str) -> Result<Self> {
@@ -408,35 +435,292 @@ pub(crate) mod linux {
             if owner != uid() {
                 return Err(failure("identity_mismatch"));
             }
+            let file = running_executable(pid)?;
+            let binary = verified_executable(&file)?;
+            let identity = identity_at(pid, &path, &binary)?;
+            let executable_info = file.metadata().map_err(|_| failure("identity_mismatch"))?;
             let pin = Self {
-                identity: identity(pid, &path)?,
+                executable: RefCell::new(ExecutablePin {
+                    file,
+                    identity: identity.clone(),
+                    permissions: (executable_info.uid(), executable_info.gid(), executable_info.mode()),
+                    deadline: None,
+                }),
+                identity,
                 pid,
                 path,
                 socket: (info.dev(), info.ino()),
+                socket_permissions: (info.uid(), info.gid(), info.mode()),
+                gateway_identity: None,
             };
             pin.check(true)?;
             Ok(pin)
         }
+        fn bound(
+            socket: &str,
+            directory: &Path,
+            gateway_identity: Option<(PathBuf, (Value, Vec<[u8; 32]>))>,
+            mut control: Option<&mut Control>,
+        ) -> Result<Self> {
+            let socket_path = path(socket)?;
+            let saved = match fs::symlink_metadata(directory.join("daemon-identity.json")) {
+                Ok(_) => Some(rebind_pin(directory)?),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return Err(failure("security_error")),
+            };
+            let mut deadline = None;
+            // Untrusted observations constrain waiting only; they never become
+            // an authenticated DaemonPin or supply an executable command path.
+            let mut waiting: Option<(File, Value, Metadata, Metadata)> = None;
+            loop {
+                interrupted()?;
+                if let Some(control) = control.as_deref_mut() { control.startup()?; }
+                if let Some((native, expected)) = &gateway_identity {
+                    native_tree(native)?;
+                    if identity_files(native, true)? != *expected {
+                        return Err(failure("identity_mismatch"));
+                    }
+                }
+                let socket_info = socket_metadata(&socket_path)?;
+                let (pid, owner) = peer(&socket_path)?;
+                if owner != uid() { return Err(failure("identity_mismatch")); }
+                let file = running_executable(pid)?;
+                let info = file.metadata().map_err(|_| failure("identity_mismatch"))?;
+                executable_metadata(&info)?;
+                let name = executable_name(&file)?;
+                let installed = if name.file_name().and_then(|v| v.to_str()) == Some("tern") {
+                    match fs::symlink_metadata(&name) {
+                        Ok(installed) => {
+                            executable_metadata(&installed)?;
+                            (installed.dev(), installed.ino()) == (info.dev(), info.ino())
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(_) => return Err(failure("security_error")),
+                    }
+                } else { false };
+                let completed = if let Some((old, _, _, _)) = &waiting {
+                    let old = old.metadata().map_err(|_| failure("identity_mismatch"))?;
+                    (old.dev(), old.ino()) != (info.dev(), info.ino())
+                } else { true };
+                if installed && completed {
+                    if deadline.is_some_and(|end| Instant::now() >= end) {
+                        return Err(failure("identity_mismatch"));
+                    }
+                    let mut pin = Self::new(socket)?;
+                    if let Some((_, observed, executable, socket)) = &waiting {
+                        migration_required(observed, &pin.record())?;
+                        if pin.executable.borrow().permissions != (executable.uid(), executable.gid(), executable.mode()) {
+                            return Err(failure("security_error"));
+                        }
+                        if pin.socket_permissions != (socket.uid(), socket.gid(), socket.mode())
+                            || Some(rebind_pin(directory)?) != saved
+                        {
+                            return Err(failure("identity_mismatch"));
+                        }
+                    }
+                    pin.gateway_identity = gateway_identity;
+                    pin.wait_ready(control.as_deref_mut())?;
+                    // persist remains the authority, including legacy migration.
+                    pin.persist(directory, control.as_deref_mut())?;
+                    return Ok(pin);
+                }
+                // No old FD: this is only permission to wait, not to trust this
+                // executable. Only a complete existing v2 binding can grant it.
+                let saved = saved.as_ref().ok_or_else(|| failure("identity_mismatch"))?;
+                validate_rebind_record(saved, socket)?;
+                if gateway_identity.is_none() { return Err(failure("identity_mismatch")); }
+                let binary = path(saved["executable_path"].as_str()
+                    .ok_or_else(|| failure("identity_mismatch"))?)?;
+                if name.parent() != binary.parent() { return Err(failure("identity_mismatch")); }
+                ancestors(binary.parent().ok_or_else(|| failure("security_error"))?)?;
+                match fs::symlink_metadata(&binary) {
+                    Ok(info) => executable_metadata(&info)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(_) => return Err(failure("security_error")),
+                }
+                let mut current = identity_at(pid, &socket_path, &binary)?;
+                current["version"] = json!(2);
+                current["daemon_socket"] = json!(socket);
+                current["socket_device"] = json!(socket_info.dev());
+                current["socket_inode"] = json!(socket_info.ino());
+                migration_required(saved, &current)?;
+                if rebind_pin(directory)? != *saved { return Err(failure("identity_mismatch")); }
+                if let Some((old, observed, executable, socket)) = &waiting {
+                    let old = old.metadata().map_err(|_| failure("identity_mismatch"))?;
+                    if current != *observed || (info.dev(), info.ino()) != (old.dev(), old.ino())
+                        || (info.uid(), info.gid(), info.mode()) != (executable.uid(), executable.gid(), executable.mode())
+                        || (socket_info.uid(), socket_info.gid(), socket_info.mode()) != (socket.uid(), socket.gid(), socket.mode())
+                    {
+                        return Err(failure("identity_mismatch"));
+                    }
+                } else {
+                    waiting = Some((file, current, info, socket_info));
+                }
+                let end = *deadline.get_or_insert_with(|| Instant::now() + UPDATE_WAIT);
+                if Instant::now() >= end { return Err(failure("identity_mismatch")); }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        fn executable_object(&self) -> Result<(u64, u64)> {
+            let info = self.executable.borrow().file.metadata()
+                .map_err(|_| failure("identity_mismatch"))?;
+            Ok((info.dev(), info.ino()))
+        }
         pub(crate) fn check(&self, responsive: bool) -> Result<()> {
-            let info = socket_metadata(&self.path)?;
-            if (info.dev(), info.ino()) != self.socket
-                || identity(self.pid, &self.path)? != self.identity
-                || (responsive && peer(&self.path)? != (self.pid, uid()))
-            {
+            if !self.observe(responsive)? {
                 return Err(failure("identity_mismatch"));
             }
             Ok(())
         }
+        // Cheap data-plane gate; full process/argv/certificate validation remains
+        // periodic, or runs immediately when this executable observation changes.
+        fn executable_unchanged(&self) -> Result<bool> {
+            let held = self.executable.borrow();
+            let binary = Path::new(self.identity["executable_path"].as_str()
+                .ok_or_else(|| failure("identity_mismatch"))?);
+            let file = running_executable(self.pid)?;
+            let running = file.metadata().map_err(|_| failure("identity_mismatch"))?;
+            let previous = held.file.metadata().map_err(|_| failure("identity_mismatch"))?;
+            let installed = match fs::symlink_metadata(binary) {
+                Ok(info) => info,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(_) => return Err(failure("security_error")),
+            };
+            Ok(held.deadline.is_none()
+                && (running.dev(), running.ino()) == (previous.dev(), previous.ino())
+                && (installed.dev(), installed.ino()) == (previous.dev(), previous.ino())
+                && (running.uid(), running.gid(), running.mode()) == held.permissions
+                && (previous.uid(), previous.gid(), previous.mode()) == held.permissions
+                && (installed.uid(), installed.gid(), installed.mode()) == held.permissions
+                && executable_metadata(&running).is_ok()
+                && executable_metadata(&previous).is_ok()
+                && executable_metadata(&installed).is_ok()
+                && executable_name(&file)? == binary)
+        }
+        fn check_gateway_identity(&self) -> Result<()> {
+            if let Some((directory, expected)) = &self.gateway_identity {
+                native_tree(directory)?;
+                if identity_files(directory, true)? != *expected {
+                    return Err(failure("identity_mismatch"));
+                }
+            }
+            Ok(())
+        }
+        // false is an authenticated file-object transition, never an ignored error.
+        fn observe(&self, responsive: bool) -> Result<bool> {
+            self.check_gateway_identity()?;
+            let mut held = self.executable.borrow_mut();
+            let binary = Path::new(self.identity["executable_path"].as_str()
+                .ok_or_else(|| failure("identity_mismatch"))?);
+            let info = socket_metadata(&self.path)?;
+            let current = identity_at(self.pid, &self.path, binary)?;
+            if (info.dev(), info.ino()) != self.socket
+                || (info.uid(), info.gid(), info.mode()) != self.socket_permissions
+                || ["pid", "start_time", "boot_id", "executable_path"].iter()
+                    .any(|field| current[*field] != held.identity[*field])
+            {
+                return Err(failure("identity_mismatch"));
+            }
+            let file = running_executable(self.pid)?;
+            let running = file.metadata().map_err(|_| failure("identity_mismatch"))?;
+            let previous = held.file.metadata().map_err(|_| failure("identity_mismatch"))?;
+            executable_metadata(&running)?;
+            executable_metadata(&previous)?;
+            if (previous.uid(), previous.gid(), previous.mode()) != held.permissions
+                || (running.uid(), running.gid(), running.mode()) != held.permissions
+            {
+                return Err(failure("security_error"));
+            }
+            let same = (running.dev(), running.ino()) == (previous.dev(), previous.ino());
+            let name = executable_name(&file)?;
+            if name.parent() != binary.parent() {
+                return Err(failure("identity_mismatch"));
+            }
+            ancestors(binary.parent().ok_or_else(|| failure("security_error"))?)?;
+            let installed = match fs::symlink_metadata(binary) {
+                Ok(info) => { executable_metadata(&info)?; Some((info.dev(), info.ino())) }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return Err(failure("security_error")),
+            };
+            if name != binary || installed != Some((running.dev(), running.ino())) {
+                if !same || current != held.identity || peer(&self.path)? != (self.pid, uid()) {
+                    return Err(failure("identity_mismatch"));
+                }
+                let deadline = *held.deadline.get_or_insert_with(|| Instant::now() + UPDATE_WAIT);
+                if Instant::now() >= deadline { return Err(failure("identity_mismatch")); }
+                return Ok(false);
+            }
+            if held.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(failure("identity_mismatch"));
+            }
+            // A rename back is not completion: require exec of a different file.
+            if held.deadline.is_some() && same {
+                if current != held.identity || peer(&self.path)? != (self.pid, uid()) {
+                    return Err(failure("identity_mismatch"));
+                }
+                return Ok(false);
+            }
+            if same {
+                if current != held.identity { return Err(failure("identity_mismatch")); }
+            } else {
+                compatible_rebind_argv(&current, &held.identity)?;
+            }
+            if verified_executable(&file)? != binary
+                || ((responsive || !same) && peer(&self.path)? != (self.pid, uid()))
+                || identity_at(self.pid, &self.path, binary)? != current
+            {
+                return Err(failure("identity_mismatch"));
+            }
+            let latest = running_executable(self.pid)?.metadata()
+                .map_err(|_| failure("identity_mismatch"))?;
+            let socket = socket_metadata(&self.path)?;
+            if (latest.dev(), latest.ino()) != (running.dev(), running.ino())
+                || (latest.uid(), latest.gid(), latest.mode()) != (running.uid(), running.gid(), running.mode())
+                || (socket.dev(), socket.ino()) != self.socket
+                || (socket.uid(), socket.gid(), socket.mode()) != self.socket_permissions
+            {
+                return Err(failure("identity_mismatch"));
+            }
+            self.check_gateway_identity()?;
+            if !same {
+                held.file = file;
+                held.identity = current;
+                held.permissions = (running.uid(), running.gid(), running.mode());
+            }
+            held.deadline = None;
+            Ok(true)
+        }
+        fn wait_ready(&self, mut control: Option<&mut Control>) -> Result<()> {
+            loop {
+                interrupted()?;
+                if let Some(control) = control.as_deref_mut() { control.startup()?; }
+                if self.observe(true)? { return Ok(()); }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        fn wait_frontend_exit(&self, control: &mut Control) -> Result<()> {
+            let previous = self.executable_object()?;
+            let deadline = Instant::now() + UPDATE_WAIT;
+            loop {
+                control.startup()?;
+                let ready = self.observe(true)?;
+                if ready && (self.executable_object()? != previous || Instant::now() >= deadline) {
+                    return Err(failure("frontend_exit"));
+                }
+                if Instant::now() >= deadline { return Err(failure("identity_mismatch")); }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
         fn record(&self) -> Value {
-            let mut value = self.identity.clone();
+            let mut value = self.executable.borrow().identity.clone();
             value["version"] = json!(2);
             value["daemon_socket"] = json!(self.path);
             value["socket_device"] = json!(self.socket.0);
             value["socket_inode"] = json!(self.socket.1);
             value
         }
-        fn persist(&self, directory: &Path) -> Result<()> {
-            self.check(true)?;
+        fn persist(&self, directory: &Path, mut control: Option<&mut Control>) -> Result<()> {
+            self.wait_ready(control.as_deref_mut())?;
             let target = directory.join("daemon-identity.json");
             let current = self.record();
             match fs::symlink_metadata(&target) {
@@ -457,8 +741,10 @@ pub(crate) mod linux {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
                 Err(_) => return Err(failure("security_error")),
             }
-            self.check(true)?;
-            common::atomic_json(&target, &current).map_err(|_| failure("security_error"))
+            self.wait_ready(control.as_deref_mut())?;
+            let latest = self.record();
+            migration_required(&current, &latest)?;
+            common::atomic_json(&target, &latest).map_err(|_| failure("security_error"))
         }
         pub(crate) fn capture(
             &self,
@@ -474,11 +760,7 @@ pub(crate) mod linux {
             mut control: Option<&mut Control>,
             maximum: usize,
         ) -> Result<Vec<u8>> {
-            self.check(true)?;
-            if let Some(c) = control.as_deref_mut() {
-                c.startup()?;
-            }
-            let mut command = self.command()?;
+            let mut command = self.command(control.as_deref_mut())?;
             command
                 .args(args)
                 .stdin(Stdio::null())
@@ -495,7 +777,7 @@ pub(crate) mod linux {
                 if let Some(c) = control.as_deref_mut() {
                     c.startup()?;
                 }
-                self.check(false)?;
+                self.wait_ready(control.as_deref_mut())?;
                 loop {
                     match output.read(&mut chunk) {
                         Ok(0) => break,
@@ -528,7 +810,7 @@ pub(crate) mod linux {
                             Err(_) => return Err(failure("unknown")),
                         }
                     }
-                    self.check(true)?;
+                    self.wait_ready(control.as_deref_mut())?;
                     return Ok(bytes);
                 }
                 if Instant::now() >= deadline {
@@ -537,8 +819,8 @@ pub(crate) mod linux {
                 thread::sleep(Duration::from_millis(50));
             }
         }
-        fn command(&self) -> Result<Command> {
-            self.check(true)?;
+        fn command(&self, control: Option<&mut Control>) -> Result<Command> {
+            self.wait_ready(control)?;
             let mut command = Command::new(
                 self.identity["executable_path"]
                     .as_str()
@@ -741,7 +1023,11 @@ pub(crate) mod linux {
         }
         fn startup(&mut self) -> Result<()> {
             interrupted()?;
-            if !self.receive()?.is_empty() || !self.buffer.is_empty() {
+            let messages = self.receive()?;
+            if messages.iter().any(|message| *message == json!({"op":"stop"})) {
+                return Err(failure("control_eof"));
+            }
+            if !messages.is_empty() || !self.buffer.is_empty() {
                 return Err(failure("protocol_error"));
             }
             Ok(())
@@ -863,11 +1149,8 @@ pub(crate) mod linux {
         request: &Value,
         mut control: Option<&mut Control>,
     ) -> Result<Prepared> {
-        let pin = DaemonPin::new(
-            request["daemon_socket"]
-                .as_str()
-                .ok_or_else(|| failure("protocol_error"))?,
-        )?;
+        let socket = request["daemon_socket"].as_str()
+            .ok_or_else(|| failure("protocol_error"))?;
         let directory = path(directory)?;
         common::private_dir(&directory, true).map_err(|_| failure("security_error"))?;
         ancestors(&directory)?;
@@ -887,7 +1170,8 @@ pub(crate) mod linux {
         if key != cert || (request.get("gateway_fingerprint").is_some() && !key) {
             return Err(failure("identity_mismatch"));
         }
-        pin.persist(&directory)?;
+        let gateway_identity = if key { Some((native.clone(), identity_files(&native, true)?)) } else { None };
+        let mut pin = DaemonPin::bound(socket, &directory, gateway_identity, control.as_deref_mut())?;
         let baseline = pin.capture(
             &["ls".into(), "--json".into()],
             control.as_deref_mut(),
@@ -921,6 +1205,9 @@ pub(crate) mod linux {
         {
             return Err(failure("identity_mismatch"));
         }
+        pin.gateway_identity = Some((native.clone(), identity_files(&native, true)?));
+        pin.wait_ready(control.as_deref_mut())?;
+        pin.persist(&directory, control.as_deref_mut())?;
         let authorized = account()?.1.join(".ssh/authorized_keys");
         if regular(&authorized, false)?
             .metadata()
@@ -1484,7 +1771,7 @@ pub(crate) mod linux {
         crate::gateway::wipe(&mut encoded.0);
         let prepared = prepare(directory, &request, Some(&mut control))?;
         control.startup()?;
-        prepared.pin.check(true)?;
+        prepared.pin.wait_ready(Some(&mut control))?;
         let version = prepared.pin.capture_output(
             &["--version".into()], Some(&mut control), 256,
         )?;
@@ -1504,7 +1791,7 @@ pub(crate) mod linux {
             .map_err(|_| failure("unknown"))?
             .port();
         drop(reservation);
-        let mut command = prepared.pin.command()?;
+        let mut command = prepared.pin.command(Some(&mut control))?;
         command
             .args([
                 "remote",
@@ -1525,14 +1812,14 @@ pub(crate) mod linux {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             control.startup()?;
-            prepared.pin.check(false)?;
+            prepared.pin.wait_ready(Some(&mut control))?;
             if child
                 .0
                 .try_wait()
                 .map_err(|_| failure("frontend_exit"))?
                 .is_some()
             {
-                return Err(failure("frontend_exit"));
+                return prepared.pin.wait_frontend_exit(&mut control);
             }
             if crate::discovery::linux::udp_listeners(child.0.id())?
                 .iter()
@@ -1545,15 +1832,17 @@ pub(crate) mod linux {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        prepared.pin.check(true)?;
+        prepared.pin.wait_ready(Some(&mut control))?;
         let mut descriptor = prepared.descriptor.clone();
         descriptor["host"] = json!(host.to_string());
         descriptor["port"] = json!(port);
         descriptor["native_frontend_pid"] = json!(child.0.id());
         emit(&descriptor)?;
         let mut heartbeat = Instant::now();
-        let mut check = heartbeat;
+        let mut frontend_exit = None;
         let mut probe = heartbeat;
+        let mut check = heartbeat;
+        let mut ready = true;
         let mut flows = FlowTable::new();
         let mut fds = Vec::with_capacity(18);
         let mut ids = Vec::with_capacity(16);
@@ -1562,26 +1851,16 @@ pub(crate) mod linux {
         let mut encoded = Vec::with_capacity(protocol::MAX_FRAME);
         loop {
             interrupted()?;
-            if child
-                .0
-                .try_wait()
-                .map_err(|_| failure("frontend_exit"))?
-                .is_some()
+            if frontend_exit.is_none() && child.0.try_wait()
+                .map_err(|_| failure("frontend_exit"))?.is_some()
             {
-                return Err(failure("frontend_exit"));
+                // Exit can precede rename. Keep the authenticated FD until exec
+                // completes, rather than handing the rename gap to a fresh helper.
+                frontend_exit = Some((Instant::now() + UPDATE_WAIT, prepared.pin.executable_object()?));
             }
             let now = Instant::now();
             if now.duration_since(heartbeat) > Duration::from_secs(45) {
                 return Err(failure("heartbeat_timeout"));
-            }
-            if now.duration_since(check) >= Duration::from_secs(1) {
-                let responsive = now.duration_since(probe) >= Duration::from_secs(5);
-                prepared.pin.check(responsive)?;
-                if responsive {
-                    probe = now;
-                }
-                check = now;
-                flows.expire(now);
             }
             fds.clear();
             ids.clear();
@@ -1628,6 +1907,32 @@ pub(crate) mod linux {
                     heartbeat = Instant::now();
                     emit(&json!({"ok":true,"op":"pong"}))?;
                 }
+            }
+            let now = Instant::now();
+            let data_ready = fds[1..].iter().any(|fd| fd.revents & libc::POLLIN != 0);
+            let executable_changed = ready && frontend_exit.is_none() && data_ready
+                && !prepared.pin.executable_unchanged()?;
+            if executable_changed { ready = false; }
+            // Full identity IO stays off the per-packet path. Once an update or
+            // frontend exit is observed, the paused loop checks every 50–300 ms.
+            if frontend_exit.is_some() || !ready || now.duration_since(check) >= Duration::from_secs(1) {
+                let responsive = now.duration_since(probe) >= Duration::from_secs(5);
+                ready = prepared.pin.observe(responsive)?;
+                if responsive { probe = now; }
+                check = now;
+                flows.expire(now);
+            }
+            if let Some((deadline, previous)) = frontend_exit {
+                if ready && (prepared.pin.executable_object()? != previous || now >= deadline) {
+                    return Err(failure("frontend_exit"));
+                }
+                if now >= deadline { return Err(failure("identity_mismatch")); }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            if !ready || executable_changed {
+                thread::sleep(Duration::from_millis(50));
+                continue;
             }
             if fds[1].revents & libc::POLLIN != 0 {
                 forward(&public, native_port, &key.0, &mut flows, &mut incoming)?;
