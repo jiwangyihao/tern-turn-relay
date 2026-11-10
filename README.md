@@ -47,9 +47,9 @@ tern plugin install github.com/jiwangyihao/tern-turn-relay
 
 Windows 请确认系统 OpenSSH 可读取当前用户的 SSH 配置、密钥与 known_hosts，不要把 Git Bash/WSL 的 SSH 配置误当原生配置。路径含空格或中文可用；向导按 argv 元素传参，不拼接 shell 命令。默认本机入口只绑定 `127.0.0.1`，不要开放到公网。下载不使用系统 HTTP 代理；企业网络需要能直接访问 GitHub HTTPS 发行资产、Cloudflare TURN TLS/UDP 与原 SSH 服务。不要通过关闭证书或身份验证绕过网络限制。
 
-## 从 0.4.x / 0.5.0–0.5.10 升级到 0.5.11
+## 从 0.4.x / 0.5.0–0.5.11 升级到 0.5.12
 
-先显式 Stop，再通过 Settings → 插件管理更新。新版本使用独立的 `native-runtime/0.5.11/`，准备失败不覆盖旧运行时、凭据或配置；配置和原网关/daemon 身份仍需通过检查，不会静默重新绑定。Windows 首次安装后必须先显式 Settings；普通 Status 查询不触发下载。显式 Stop 为保持旧版迁移兼容，可以先准备缺失的控制程序，失败时不会断开 Host 或假报已停止。所有实际原生命令都经 `--exec` 再次验证程序完整性；不能把文件存在或一次 Settings 成功当作后续执行授权。
+先显式 Stop，再通过 Settings → 插件管理更新。新版本使用独立的 `native-runtime/0.5.12/`，准备失败不覆盖旧运行时、凭据或配置；配置和原网关/daemon 身份仍需通过检查，不会静默重新绑定。Windows 首次安装后必须先显式 Settings；普通 Status 查询不触发下载。显式 Stop 为保持旧版迁移兼容，可以先准备缺失的控制程序，失败时不会断开 Host 或假报已停止。所有实际原生命令都经 `--exec` 再次验证程序完整性；不能把文件存在或一次 Settings 成功当作后续执行授权。
 
 ## 从 0.3.x 升级
 
@@ -83,6 +83,13 @@ TURN 临时凭据续发与 allocation 续期分别处理。现有连接和预热
 
 审核与应用之间身份发生变化会拒绝提交，必须重新审核。该操作不重启 daemon、不修改凭据或证书、不自动启动连接；普通 Start 仍拒绝未知 daemon 身份变化。不要删除 `daemon-identity.json` 绕过检查。Tern 自身冷启动可能重建终端并自动恢复任务，重绑不保证原进程存活，也不修复其多客户端布局同步。
 
+### Tern 就地更新期间的自动恢复
+
+Tern 更新远端时可能先重命名正在运行的旧程序，再执行新程序。插件仅对已核验的同一 daemon 处理这一过渡：暂停转发，在固定 8 秒期限内核对运行文件、规范路径、PID、启动时间、socket 和参数；核验完成后继续服务或重建专用 frontend。控制通道关闭或 Stop 仍立即撤销连接。
+
+该机制不允许未知身份自动重绑。超时、PID/socket/权限/证书变化或非允许参数变化仍拒绝；真正更换 daemon 时使用上述审核重绑流程。已在旧版本进入终止错误态的连接，需要升级插件后重新连接一次。
+
+
 
 ## 路径与安全约束
 
@@ -109,7 +116,7 @@ TURN 不是普通 HTTP CDN。Rust 的原型测量显示进程内存和分发体�
 | Windows | 默认数据目录为 `%LOCALAPPDATA%\Tern\plugin-data\tern-turn-relay\`；插件代码位于 `%APPDATA%\Tern\plugins\tern-turn-relay\`，两者不是同一个目录。自定义 profile 以 Tern 实际传入并经核验的路径为准 |
 
 - `credentials/cloudflare.json`：Unix 使用目录 0700、文件 0600 的私有明文文件；Windows 保存用户级 DPAPI 密文，同时保留私有文件 DACL。Windows 密文不能直接复制给另一用户使用；旧明文文件不会静默加载，需在 Settings 显式重新配置，取消时保留原文件。输入文件仍须满足私有文件要求。
-- `native-runtime/0.5.11/`：经版本、大小和 SHA-256 校验的本机程序（Windows 为 `tern-turn-relay.exe`）与发行清单，以及按需下载的 Linux helper。
+- `native-runtime/0.5.12/`：经版本、大小和 SHA-256 校验的本机程序（Windows 为 `tern-turn-relay.exe`）与发行清单，以及按需下载的 Linux helper。
 - `config.json`、`installation.json`：非秘密配置及安装归属。
 - `runtime/`：生命周期锁、原生控制入口、状态和恢复意图。不要自行删除锁或按 PID/进程名杀进程来绕过检查。
 - Windows 私有资源在创建时使用当前用户、SYSTEM 与 Administrators 的受保护 DACL；本机仅接受规范的盘符绝对路径，远端路径仍为 POSIX。原子比较并替换使用 TxF 内核事务写锁、事务内私有暂存文件、`MoveFileTransacted` 与提交，避免检查后同名替换造成丢失更新；不采用「检查后 rename」或「先删除再重写」降级。
