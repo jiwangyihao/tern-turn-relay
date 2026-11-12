@@ -6,7 +6,7 @@ end
 
 function cases.windows_paths_are_separate_arguments()
     local p = new({ os = 'windows' }, { data = 'C:\\用户\\我的 Tern\\data', dir = 'C:/用户/我的 Tern/plugin' })
-    assert(p.supported and p.binary == 'C:/用户/我的 Tern/data/native-runtime/0.5.15/tern-turn-relay.exe')
+    assert(p.supported and p.binary == 'C:/用户/我的 Tern/data/native-runtime/0.5.16/tern-turn-relay.exe')
     local argv = p.bootstrap('--prepare')
     assert(argv[1] == 'D:/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe')
     assert(argv[7] == '-File' and argv[8] == 'C:/用户/我的 Tern/plugin/bootstrap-runtime.ps1')
@@ -31,9 +31,9 @@ function cases.report_never_promotes_to_prepare()
         local p = new({ os = os }, { data = os == 'windows' and 'C:/用户/data' or '/Users/用户/data', dir = os == 'windows' and 'C:/用户/plugin' or '/Users/用户/plugin' })
         for _, arg in ipairs(p.bootstrap('report')) do assert(arg ~= '--prepare') end
         assert(not p.ready({ ok = true, binary = p.binary, runtime_ready = true, version = '0.4.0' }))
-        assert(not p.ready({ ok = true, binary = p.binary, runtime_ready = false, version = '0.5.15' }))
-        assert(not p.ready({ ok = false, binary = p.binary, runtime_ready = true, version = '0.5.15' }))
-        assert(p.ready({ ok = true, binary = p.binary, runtime_ready = true, version = '0.5.15' }))
+        assert(not p.ready({ ok = true, binary = p.binary, runtime_ready = false, version = '0.5.16' }))
+        assert(not p.ready({ ok = false, binary = p.binary, runtime_ready = true, version = '0.5.16' }))
+        assert(p.ready({ ok = true, binary = p.binary, runtime_ready = true, version = '0.5.16' }))
     end
 end
 
@@ -44,7 +44,7 @@ function cases.unix_clients_share_the_sh_bootstrap()
         local argv = p.bootstrap('--prepare')
         assert(#argv == 4 and argv[1] == '/bin/sh' and argv[2] == '/home/a b/plugin/bootstrap-runtime.sh')
         assert(argv[3] == '/home/a b/data' and argv[4] == '--prepare')
-        assert(p.binary == '/home/a b/data/native-runtime/0.5.15/tern-turn-relay')
+        assert(p.binary == '/home/a b/data/native-runtime/0.5.16/tern-turn-relay')
     end
     local ios = Platform.new({ os = 'ios' }, { data = '/tmp/data', dir = '/tmp/plugin' })
     assert(not ios.supported)
@@ -56,8 +56,8 @@ function cases.unsafe_paths_and_runtime_substitution_are_rejected()
         assert(not new({ os = 'windows' }, { data = path, dir = 'C:/plugin' }).supported)
     end
     local p = new({ os = 'windows' }, { data = 'C:/data', dir = 'C:/plugin' })
-    assert(p.ready({ ok = true, runtime_ready = true, version = '0.5.15', binary = '\\\\?\\C:\\data\\native-runtime\\0.5.15\\tern-turn-relay.exe' }))
-    assert(not p.ready({ ok = true, runtime_ready = true, version = '0.5.15', binary = 'C:/data/native-runtime/0.5.15/../evil.exe' }))
+    assert(p.ready({ ok = true, runtime_ready = true, version = '0.5.16', binary = '\\\\?\\C:\\data\\native-runtime\\0.5.16\\tern-turn-relay.exe' }))
+    assert(not p.ready({ ok = true, runtime_ready = true, version = '0.5.16', binary = 'C:/data/native-runtime/0.5.16/../evil.exe' }))
 end
 
 function cases.untrusted_or_missing_system_root_fails_closed()
