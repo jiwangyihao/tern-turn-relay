@@ -468,6 +468,27 @@ function cases.rtt_history_survives_a_new_vm_and_expires()
     assert(saved and #saved == 12 and saved[#saved].ms == 350, 'ten new samples are saved for the next VM')
 end
 
+function cases.throughput_is_counter_delta_and_restarts_after_a_reset()
+    local f = fixture('macos', true, true)
+    f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', detail = { fingerprint = 'relay-pin' } } }
+    local function poll(down, up)
+        f.time += 3000; f:flush()
+        local value = f:value('ready', 'tls')
+        value.bytes_down, value.bytes_up = down, up
+        f:complete(value)
+    end
+    f:complete(f:value('ready', 'tls'))
+    assert(f.widgets.rate.render(nil).text == '↓— ↑—', 'one answer is only a baseline')
+    poll(3 * 1024 * 1024, 3 * 1024)
+    assert(f.widgets.rate.render(nil).text == '↓1.0M ↑1.0K')
+    assert(f:view().title:find('\n吞吐: ↓1.0 MiB/s · ↑1.0 KiB/s\n', 1, true), 'the card shows the current rates')
+    poll(1024, 0)
+    assert(f.widgets.rate.render(nil).text == '↓— ↑—', 'a counter that went back is a new baseline, not a negative rate')
+    poll(1024 + 3 * 512 * 1024, 0)
+    assert(f.widgets.rate.render(nil).text == '↓512K ↑0B')
+    assert(f:view().title:find('峰值 ↓1.0 MiB/s · ↑1.0 KiB/s', 1, true), 'the peak spans the whole history')
+end
+
 return { run = function()
     local count = 0
     for name, test in pairs(cases) do

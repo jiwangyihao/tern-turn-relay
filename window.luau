@@ -24,14 +24,18 @@ local lastError = nil
 local cache = { state = "stopped", mode = nil, bytes_up = 0, bytes_down = 0, flows = 0, ssh_connections = 0,
     queued_packets = 0, queued_bytes = 0, queue_dropped_packets = 0, queue_dropped_bytes = 0, congested = false }
 local statusText = "TURN · 已停止"
--- Tern's own measured RTT of the dedicated Host: one sample per poll, kept in tern.kv so
--- a reload or a new window starts with the recent graph instead of an empty one.
-local RTT_KEEP = 120
-local RTT_WINDOW_S = 360
+-- Histories sampled once per poll and kept in tern.kv, so a reload or a new window
+-- starts with the recent graphs: Tern's measured RTT of the dedicated Host, and the
+-- relay's throughput from its byte counters.
+local HISTORY_KEEP = 120
+local HISTORY_WINDOW_S = 360
 local RTT_FLOOR_MS = 600
 local RTT_SLOW_MS = 800
+local RATE_FLOOR = 64 * 1024
 local RTT_KV = "rtt-history"
+local RATE_KV = "rate-history"
 local rtt = { samples = {}, at = nil, last = nil, median = nil, max = nil, unsaved = 0 }
+local rate = { samples = {}, prev = nil, up = nil, down = nil, peakUp = 0, peakDown = 0, unsaved = 0 }
 local pollDue = nil
 local lastStatusAt = nil
 local installedCss = nil
@@ -57,6 +61,36 @@ do
     if not hasConfig then statusText = "TURN · 待配置" elseif not helperReady then statusText = "TURN · 待升级" end
 end
 
+local function trimSamples(samples, now)
+    while #samples > HISTORY_KEEP or (samples[1] and samples[1].t < now - HISTORY_WINDOW_S) do
+        table.remove(samples, 1)
+    end
+end
+
+local function saveSamples(history, key)
+    history.unsaved = 0
+    pcall(tern.kv.set, key, history.samples)
+end
+
+local function loadSamples(key, fields)
+    local samples = {}
+    local ok, saved = pcall(tern.kv.get, key)
+    local now = os.time()
+    if not ok or type(saved) ~= "table" then return samples end
+    for _, sample in ipairs(saved) do
+        local valid = type(sample) == "table" and type(sample.t) == "number" and sample.t <= now
+        local copy = { t = valid and sample.t or nil }
+        for _, field in ipairs(fields) do
+            local value = valid and sample[field]
+            valid = valid and type(value) == "number" and value >= 0 and value < math.huge
+            copy[field] = value
+        end
+        if valid then table.insert(samples, copy) end
+    end
+    trimSamples(samples, now)
+    return samples
+end
+
 local function rttStats()
     local sorted = table.create(#rtt.samples)
     for index, sample in ipairs(rtt.samples) do sorted[index] = sample.ms end
@@ -65,31 +99,18 @@ local function rttStats()
     rtt.max = sorted[#sorted]
 end
 
-local function trimRtt(now)
-    while #rtt.samples > RTT_KEEP or (rtt.samples[1] and rtt.samples[1].t < now - RTT_WINDOW_S) do
-        table.remove(rtt.samples, 1)
+local function rateStats()
+    rate.peakUp, rate.peakDown = 0, 0
+    for _, sample in ipairs(rate.samples) do
+        rate.peakUp = math.max(rate.peakUp, sample.up)
+        rate.peakDown = math.max(rate.peakDown, sample.down)
     end
 end
 
-local function saveRtt()
-    rtt.unsaved = 0
-    pcall(tern.kv.set, RTT_KV, rtt.samples)
-end
-
-do
-    local ok, saved = pcall(tern.kv.get, RTT_KV)
-    local now = os.time()
-    if ok and type(saved) == "table" then
-        for _, sample in ipairs(saved) do
-            if type(sample) == "table" and type(sample.t) == "number" and sample.t <= now
-                and type(sample.ms) == "number" and sample.ms >= 0 and sample.ms < math.huge then
-                table.insert(rtt.samples, { t = sample.t, ms = sample.ms })
-            end
-        end
-        trimRtt(now)
-    end
-    rttStats()
-end
+rtt.samples = loadSamples(RTT_KV, { "ms" })
+rttStats()
+rate.samples = loadSamples(RATE_KV, { "up", "down" })
+rateStats()
 
 local function text(value, max)
     return type(value) == "string" and #value > 0 and #value <= max
@@ -199,10 +220,34 @@ local function recordRtt(host)
     rtt.last = ms
     local wall = os.time()
     table.insert(rtt.samples, { t = wall, ms = ms })
-    trimRtt(wall)
+    trimSamples(rtt.samples, wall)
     rttStats()
     rtt.unsaved += 1
-    if rtt.unsaved >= 10 then saveRtt() end
+    if rtt.unsaved >= 10 then saveSamples(rtt, RTT_KV) end
+end
+
+-- Throughput from the relay's cumulative byte counters between two status answers of
+-- the same service; a restart or a counter that went back starts a new baseline.
+local function recordRate(value)
+    if value.state ~= "ready" then rate.prev = nil; rate.up = nil; rate.down = nil; return end
+    local now = tern.now()
+    local previous = rate.prev
+    if previous and previous.service == value.service_id and now - previous.at < 1000 then return end
+    rate.prev = { at = now, up = value.bytes_up, down = value.bytes_down, service = value.service_id }
+    local up = previous and value.bytes_up - previous.up
+    local down = previous and value.bytes_down - previous.down
+    if not previous or previous.service ~= value.service_id or up < 0 or down < 0 then
+        rate.up = nil; rate.down = nil
+        return
+    end
+    local seconds = (now - previous.at) / 1000
+    rate.up, rate.down = up / seconds, down / seconds
+    local wall = os.time()
+    table.insert(rate.samples, { t = wall, up = rate.up, down = rate.down })
+    trimSamples(rate.samples, wall)
+    rateStats()
+    rate.unsaved += 1
+    if rate.unsaved >= 10 then saveSamples(rate, RATE_KV) end
 end
 
 local function report(cx, message)
@@ -218,6 +263,7 @@ local function accept(value)
     if value.address then alias = value.address end
     if value.error then lastError = value.error:gsub("[%c]", " ")
     elseif previousError and lastError == previousError:gsub("[%c]", " ") then lastError = nil end
+    recordRate(value)
 end
 
 
@@ -1112,7 +1158,8 @@ local function clickAction(review)
 end
 
 local BACKEND = { ready = "就绪", starting = "启动中", stopped = "已停止", error = "不可用" }
-local CARD = '.kit-popover.wgc[data-widget="tern-turn-relay/turn"]'
+-- Both widgets (latency and throughput) share one card.
+local CARD = '.kit-popover.wgc[data-widget^="tern-turn-relay/"]'
 -- Status pill in the card head, as Memory's: dot color, then tint.
 local PILL = {
     ok = { "var(--ok)", "rgb(from var(--ok) r g b / 12%)" },
@@ -1121,6 +1168,21 @@ local PILL = {
 }
 local CHART_W = 272
 local CHART_H = 56
+local COMPACT = { "B", "K", "M", "G" }
+
+local function speed(value) return bytes(value) .. "/s" end
+
+-- "1.2M", "35K": the bar's short form of a byte rate.
+local function compact(value)
+    local unit = 1
+    while value >= 1024 and unit < #COMPACT do value /= 1024; unit += 1 end
+    return string.format((unit == 1 or value >= 10) and "%.0f%s" or "%.1f%s", value, COMPACT[unit])
+end
+
+local function rateText()
+    if rate.down then return "↓" .. compact(rate.down) .. " ↑" .. compact(rate.up) end
+    return cache.state == "ready" and "↓— ↑—" or phaseLabel()
+end
 
 local function reviewing()
     return onboarding ~= nil and onboarding.reviewed ~= nil
@@ -1179,6 +1241,13 @@ local function cardRows(review, action)
     if #rtt.samples > 0 then
         marks.graph = pair(span(os.time() - rtt.samples[1].t), string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max))
     end
+    if hasConfig and not review and (rate.down or #rate.samples > 0) then
+        marks.rate = pair("吞吐", rate.down and ("↓" .. speed(rate.down) .. " · ↑" .. speed(rate.up)) or "—")
+        if #rate.samples > 0 then
+            marks.rateGraph = pair(span(os.time() - rate.samples[1].t),
+                "峰值 ↓" .. speed(rate.peakDown) .. " · ↑" .. speed(rate.peakUp))
+        end
+    end
     if hasConfig and not review then
         marks.section = pair("中继", BACKEND[cache.state] or cache.state)
         pair("连接", string.format("TURN %d · SSH %d", cache.flows, cache.ssh_connections))
@@ -1210,27 +1279,41 @@ local function quoted(value)
     return '"' .. escaped .. '"'
 end
 
--- An area chart like CPU's: the latency history oldest left, a dashed median. A data
--- URI cannot read theme variables, so it uses translucent greys that read on both.
-local function chartSvg()
-    local count = #rtt.samples
-    local scale = math.max(RTT_FLOOR_MS, rtt.max) * 1.1
-    local function y(ms) return CHART_H - math.min(ms / scale, 1) * (CHART_H - 2) end
-    local points = {}
-    if count == 1 then
-        points = { string.format("0,%.1f", y(rtt.samples[1].ms)), string.format("%d,%.1f", CHART_W, y(rtt.samples[1].ms)) }
-    else
-        for index, sample in ipairs(rtt.samples) do
-            table.insert(points, string.format("%.1f,%.1f", (index - 1) / (count - 1) * CHART_W, y(sample.ms)))
-        end
+local function points(values, scale)
+    local function y(value) return CHART_H - math.min(value / scale, 1) * (CHART_H - 2) end
+    if #values == 1 then return string.format("0,%.1f %d,%.1f", y(values[1]), CHART_W, y(values[1])), y end
+    local out = table.create(#values)
+    for index, value in ipairs(values) do
+        out[index] = string.format("%.1f,%.1f", (index - 1) / (#values - 1) * CHART_W, y(value))
     end
-    local line = table.concat(points, " ")
-    local median = y(rtt.median)
+    return table.concat(out, " "), y
+end
+
+-- An area chart like CPU's: one series as the filled area, another as a dashed line. A
+-- data URI cannot read theme variables, so it uses translucent greys that read on both.
+local function chartSvg(area, dashed)
     return string.format("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 %d %d' preserveAspectRatio='none'>"
         .. "<polygon fill='rgba(128,128,128,0.16)' points='0,%d %s %d,%d'/>"
-        .. "<line x1='0' x2='%d' y1='%.1f' y2='%.1f' stroke='rgba(128,128,128,0.7)' stroke-width='1' stroke-dasharray='3 3'/>"
+        .. "<polyline fill='none' stroke='rgba(128,128,128,0.75)' stroke-width='1' stroke-dasharray='3 3' points='%s'/>"
         .. "<polyline fill='none' stroke='rgba(112,112,112,0.95)' stroke-width='1.5' stroke-linejoin='round' points='%s'/></svg>",
-        CHART_W, CHART_H, CHART_H, line, CHART_W, CHART_H, CHART_W, median, median, line)
+        CHART_W, CHART_H, CHART_H, area, CHART_W, CHART_H, dashed, area)
+end
+
+-- Latency oldest left, the median dashed.
+local function rttChart()
+    local values = table.create(#rtt.samples)
+    for index, sample in ipairs(rtt.samples) do values[index] = sample.ms end
+    local line, y = points(values, math.max(RTT_FLOOR_MS, rtt.max) * 1.1)
+    local median = y(rtt.median)
+    return chartSvg(line, string.format("0,%.1f %d,%.1f", median, CHART_W, median))
+end
+
+-- Download as the area, upload dashed, on one scale.
+local function rateChart()
+    local down, up = table.create(#rate.samples), table.create(#rate.samples)
+    for index, sample in ipairs(rate.samples) do down[index] = sample.down; up[index] = sample.up end
+    local scale = math.max(RATE_FLOOR, rate.peakDown, rate.peakUp) * 1.1
+    return chartSvg((points(down, scale)), (points(up, scale)))
 end
 
 -- Tern's card has no hero, pill, chart or sections for plugins; this sheet draws them
@@ -1254,14 +1337,24 @@ local function cardCss(marks, tone)
         table.insert(css, row(marks.hero) .. ' .wgc-k::after { content: "ms"; margin-left: 4px; font: 400 13px var(--sans);'
             .. " letter-spacing: 0; color: var(--t3); }")
     end
-    if marks.graph then
-        table.insert(css, row(marks.graph) .. " { padding-top: 62px; min-height: 18px; line-height: 18px;"
-            .. ' background: url("data:image/svg+xml;utf8,' .. chartSvg() .. '") 0 2px / 100% ' .. CHART_H .. "px no-repeat; }")
-        table.insert(css, row(marks.graph) .. " .wgc-k, " .. row(marks.graph) .. " .wgc-v { font-size: 11.5px; color: var(--t3); }")
+    local function chart(index, svg)
+        table.insert(css, row(index) .. " { padding-top: 62px; min-height: 18px; line-height: 18px;"
+            .. ' background: url("data:image/svg+xml;utf8,' .. svg .. '") 0 2px / 100% ' .. CHART_H .. "px no-repeat; }")
+        table.insert(css, row(index) .. " .wgc-k, " .. row(index) .. " .wgc-v { font-size: 11.5px; color: var(--t3); }")
+        table.insert(css, row(index) .. " .wgc-v { max-width: none; }")
     end
+    local function section(index)
+        table.insert(css, row(index) .. " { margin: 8px -12px 2px; padding: 8px 12px 0; border-top: 1px solid var(--l1); }")
+        table.insert(css, row(index) .. " .wgc-k { font-weight: 550; color: var(--t2); }")
+    end
+    if marks.graph then chart(marks.graph, rttChart()) end
+    if marks.rate then
+        section(marks.rate)
+        table.insert(css, row(marks.rate) .. " .wgc-v { font: 11.5px var(--mono); color: var(--t1); }")
+    end
+    if marks.rateGraph then chart(marks.rateGraph, rateChart()) end
     if marks.section then
-        table.insert(css, row(marks.section) .. " { margin: 8px -12px 2px; padding: 8px 12px 0; border-top: 1px solid var(--l1); }")
-        table.insert(css, row(marks.section) .. " .wgc-k { font-weight: 550; color: var(--t2); }")
+        section(marks.section)
         table.insert(css, row(marks.section) .. " .wgc-v { font: 11.5px var(--sans); color: var(--t3); }")
     end
     if marks.problem then table.insert(css, row(marks.problem) .. " .wgc-v { color: var(--bad); }") end
@@ -1315,6 +1408,30 @@ tern.chrome.widget("turn", {
         }
     end,
 })
+tern.chrome.widget("rate", {
+    name = "TURN 吞吐",
+    description = "经 TURN 的实时下行 / 上行速度；悬停看详情",
+    icon = "activity",
+    styles = { "graph", "text" },
+    render = function()
+        local review = reviewing()
+        local command, action = clickAction(review)
+        local rows = cardRows(review, action)
+        local series = nil
+        if #rate.samples > 0 then
+            local scale = math.max(RATE_FLOOR, rate.peakDown)
+            series = table.create(#rate.samples)
+            for index, sample in ipairs(rate.samples) do series[index] = math.min(sample.down / scale, 1) end
+        end
+        return {
+            text = rateText(),
+            tone = lastError and "error" or "muted",
+            title = table.concat(rows, "\n"),
+            command = command,
+            series = series,
+        }
+    end,
+})
 end
 
 -- Polling must survive hooks that were cut off: ordinary window events and a budget
@@ -1323,7 +1440,10 @@ for _, event in ipairs({ "focus", "command_finished", "cwd", "title" }) do
     tern.on(event, function() revive() end)
 end
 pcall(tern.on, "budget", function(ev) if type(ev) == "table" and ev.state == "resumed" then revive() end end)
-pcall(tern.on, "unload", function() if rtt.unsaved > 0 then saveRtt() end end)
+pcall(tern.on, "unload", function()
+    if rtt.unsaved > 0 then saveSamples(rtt, RTT_KV) end
+    if rate.unsaved > 0 then saveSamples(rate, RATE_KV) end
+end)
 refresh()
 
 -- A plugin reload need not emit window_start, and headless timer clocks may be
