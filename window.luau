@@ -28,7 +28,6 @@ local statusText = "TURN · 已停止"
 -- a reload or a new window starts with the recent graph instead of an empty one.
 local RTT_KEEP = 120
 local RTT_WINDOW_S = 360
-local RTT_BARS = 30
 local RTT_FLOOR_MS = 600
 local RTT_SLOW_MS = 800
 local RTT_KV = "rtt-history"
@@ -1114,11 +1113,14 @@ end
 
 local BACKEND = { ready = "就绪", starting = "启动中", stopped = "已停止", error = "不可用" }
 local CARD = '.kit-popover.wgc[data-widget="tern-turn-relay/turn"]'
-local BADGE = {
-    ok = { "var(--ok)", "rgb(from var(--ok) r g b / 14%)" },
-    warn = { "var(--t1)", "rgb(from var(--warn) r g b / 16%)" },
-    bad = { "var(--t1)", "rgb(from var(--bad) r g b / 14%)" },
+-- Status pill in the card head, as Memory's: dot color, then tint.
+local PILL = {
+    ok = { "var(--ok)", "rgb(from var(--ok) r g b / 12%)" },
+    warn = { "var(--warn)", "rgb(from var(--warn) r g b / 14%)" },
+    bad = { "var(--bad)", "rgb(from var(--bad) r g b / 12%)" },
 }
+local CHART_W = 272
+local CHART_H = 56
 
 local function reviewing()
     return onboarding ~= nil and onboarding.reviewed ~= nil
@@ -1128,21 +1130,23 @@ local function connectedRtt()
     return cache.state == "ready" and nativeState == "connected" and rtt.last or nil
 end
 
--- The bar's word and the card's hero: the latency while connected, else the phase.
-local function headline(review)
-    if review then return "确认配置" end
-    if not hasConfig or not helperReady then return (statusText:gsub("^TURN · ", "")) end
+-- The bar's word: the latency while connected, else the phase.
+local function barText(review)
+    if review then return "TURN · 确认配置" end
+    if not hasConfig or not helperReady then return statusText end
     local ms = connectedRtt()
     return ms and string.format("%.0f ms", ms) or phaseLabel()
 end
 
-local function barText(review)
-    if review then return "TURN · 确认配置" end
-    if not hasConfig or not helperReady then return statusText end
-    return headline(review)
+-- The card's hero: the latency figure (its unit is drawn by the sheet), else the phase.
+local function heroText(review)
+    if review then return "确认配置" end
+    if not hasConfig or not helperReady then return (statusText:gsub("^TURN · ", "")) end
+    local ms = connectedRtt()
+    return ms and string.format("%.0f", ms) or phaseLabel()
 end
 
--- "ok", "warn", "bad" or nil (neutral): the bar tone, the hero color and the badge.
+-- "ok", "warn", "bad" or nil (neutral): the bar tone, the hero color and the head pill.
 local function health()
     if lastError then return "bad" end
     if cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0
@@ -1157,7 +1161,7 @@ local function span(seconds)
 end
 
 -- The card is the `title` rows Tern draws; a "key: value" line becomes two columns. The
--- marks name the rows the card sheet styles: hero, graph, problem, action and foot.
+-- marks name the rows the card sheet styles: hero, graph, section, problem and foot.
 local function cardRows(review, action)
     local rows, marks = {}, {}
     local function add(line) table.insert(rows, (line:gsub("[%c]", " "))); return #rows end
@@ -1165,17 +1169,22 @@ local function cardRows(review, action)
         local shown = string.gsub(tostring(value), ": ", "：")
         return add(key .. ": " .. shown)
     end
-    marks.hero = add(headline(review))
+    local configured = hasConfig and helperReady and not review
+    if configured then
+        local name = cache.target and cache.target.name
+        marks.hero = pair(heroText(review), (cache.mode and string.upper(cache.mode) or "TURN") .. (name and " · " .. name or ""))
+    else
+        marks.hero = add(heroText(review))
+    end
     if #rtt.samples > 0 then
-        marks.graph = pair(span(os.time() - rtt.samples[1].t),
-            string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max))
+        marks.graph = pair(span(os.time() - rtt.samples[1].t), string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max))
     end
     if hasConfig and not review then
-        local endpoint = cache.address and cache.address:match("@(.+)$")
-        if cache.mode then pair("传输", string.upper(cache.mode) .. (endpoint and " · " .. endpoint or "")) end
-        pair("后台", BACKEND[cache.state] or cache.state)
+        marks.section = pair("中继", BACKEND[cache.state] or cache.state)
         pair("连接", string.format("TURN %d · SSH %d", cache.flows, cache.ssh_connections))
         pair("流量", "↑" .. bytes(cache.bytes_up) .. " ↓" .. bytes(cache.bytes_down))
+        local endpoint = cache.address and cache.address:match("@(.+)$")
+        if endpoint then pair("入口", endpoint) end
         if cache.queued_packets > 0 then pair("排队", string.format("%d 包 · %s", cache.queued_packets, bytes(cache.queued_bytes))) end
         if cache.queue_dropped_packets > 0 then pair("上行丢弃", string.format("%d 包", cache.queue_dropped_packets)) end
         if cache.gateway_recovering then
@@ -1187,8 +1196,12 @@ local function cardRows(review, action)
     end
     local problem = lastError or cache.error
     if problem then marks.problem = pair("异常", problem) end
-    if action then marks.action = pair("点击", action) end
-    if lastStatusAt and hasConfig then marks.foot = pair("更新于", os.date("%H:%M:%S", lastStatusAt)) end
+    if hasConfig or action then
+        local when = not hasConfig and "未配置"
+            or (lastStatusAt and "更新于 " .. os.date("%H:%M:%S", lastStatusAt) or "等待状态")
+        marks.foot = pair(when, action and action .. " ›" or "每 3 秒刷新")
+        marks.action = action ~= nil
+    end
     return rows, marks
 end
 
@@ -1197,48 +1210,67 @@ local function quoted(value)
     return '"' .. escaped .. '"'
 end
 
--- Columns like the CPU widget's: each the peak of its slice of the history, oldest
--- left; slow slices in the warning color. The scale never shrinks below RTT_FLOOR_MS.
-local function barLayers()
+-- An area chart like CPU's: the latency history oldest left, a dashed median. A data
+-- URI cannot read theme variables, so it uses translucent greys that read on both.
+local function chartSvg()
     local count = #rtt.samples
-    local per = math.ceil(count / RTT_BARS)
-    local bars = math.ceil(count / per)
-    local scale = math.max(RTT_FLOOR_MS, rtt.max)
-    local layers = table.create(bars)
-    for bar = 1, bars do
-        local first = (bar - 1) * per + 1
-        local peak = 0
-        for index = first, math.min(count, first + per - 1) do peak = math.max(peak, rtt.samples[index].ms) end
-        local color = peak >= RTT_SLOW_MS and "var(--warn)"
-            or (bar == bars and "var(--accent)" or "rgb(from var(--accent) r g b / 45%)")
-        layers[bar] = string.format("linear-gradient(%s, %s) %dpx 100%% / 6px %dpx no-repeat",
-            color, color, (RTT_BARS - bars + bar - 1) * 9, math.max(2, math.floor(peak / scale * 30 + 0.5)))
+    local scale = math.max(RTT_FLOOR_MS, rtt.max) * 1.1
+    local function y(ms) return CHART_H - math.min(ms / scale, 1) * (CHART_H - 2) end
+    local points = {}
+    if count == 1 then
+        points = { string.format("0,%.1f", y(rtt.samples[1].ms)), string.format("%d,%.1f", CHART_W, y(rtt.samples[1].ms)) }
+    else
+        for index, sample in ipairs(rtt.samples) do
+            table.insert(points, string.format("%.1f,%.1f", (index - 1) / (count - 1) * CHART_W, y(sample.ms)))
+        end
     end
-    return table.concat(layers, ", ")
+    local line = table.concat(points, " ")
+    local median = y(rtt.median)
+    return string.format("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 %d %d' preserveAspectRatio='none'>"
+        .. "<polygon fill='rgba(128,128,128,0.16)' points='0,%d %s %d,%d'/>"
+        .. "<line x1='0' x2='%d' y1='%.1f' y2='%.1f' stroke='rgba(128,128,128,0.7)' stroke-width='1' stroke-dasharray='3 3'/>"
+        .. "<polyline fill='none' stroke='rgba(112,112,112,0.95)' stroke-width='1.5' stroke-linejoin='round' points='%s'/></svg>",
+        CHART_W, CHART_H, CHART_H, line, CHART_W, CHART_H, CHART_W, median, median, line)
 end
 
--- Tern's card has no hero, badge or chart for plugins; this sheet draws them over the
--- rows. It relies on the card's markup, so a markup change degrades to plain rows.
+-- Tern's card has no hero, pill, chart or sections for plugins; this sheet draws them
+-- over the rows. It relies on the card's markup, so a markup change degrades to rows.
 local function cardCss(marks, tone)
     local function row(index) return CARD .. " .wgc-row:nth-child(" .. index .. ")" end
-    local hero = tone == "bad" and "var(--bad)" or (tone == "warn" and "var(--warn)" or "var(--t1)")
-    local badge = BADGE[tone] or { "var(--t2)", "var(--l1)" }
-    local label = hasConfig and ((cache.mode and string.upper(cache.mode) .. " · " or "") .. phaseLabel()) or "TURN"
+    local pill = PILL[tone] or { "var(--t4)", "var(--l1)" }
+    local heroColor = tone == "bad" and "var(--bad)" or (tone == "warn" and "var(--warn)" or "var(--t1)")
+    local label = reviewing() and "待确认" or (not hasConfig and "未配置") or (not helperReady and "待升级") or phaseLabel()
     local css = {
-        CARD .. " .wgc-v { max-width: 72%; overflow: hidden; text-overflow: ellipsis; }",
-        row(marks.hero) .. " { min-height: 32px; align-items: center; }",
-        row(marks.hero) .. " .wgc-k { font: 550 24px/28px var(--mono); letter-spacing: -0.03em; color: " .. hero .. "; }",
-        row(marks.hero) .. "::after { content: " .. quoted(label) .. "; flex: none; height: 20px; line-height: 20px;"
-            .. " padding: 0 8px; border-radius: 999px; font-size: 11.5px; color: " .. badge[1] .. "; background: " .. badge[2] .. "; }",
+        CARD .. " .wgc-sec { border-top: 0; padding-top: 0; }",
+        CARD .. " .wgc-head::after { content: " .. quoted(label) .. "; flex: none; height: 20px; line-height: 20px;"
+            .. " padding: 0 8px 0 17px; margin-right: -2px; border-radius: 999px; font-size: 11.5px; color: var(--t2);"
+            .. " background: radial-gradient(circle at 9px 50%, " .. pill[1] .. " 0 3px, transparent 3.5px), " .. pill[2] .. "; }",
+        CARD .. " .wgc-v { max-width: 70%; overflow: hidden; text-overflow: ellipsis; }",
+        row(marks.hero) .. " { min-height: 34px; line-height: 30px; align-items: baseline; }",
+        row(marks.hero) .. " .wgc-k { flex: none; font: 550 26px/30px var(--mono); letter-spacing: -0.03em; color: " .. heroColor .. "; }",
+        row(marks.hero) .. " .wgc-v { margin-left: auto; font: 11.5px var(--mono); color: var(--t3); }",
     }
+    if connectedRtt() then
+        table.insert(css, row(marks.hero) .. ' .wgc-k::after { content: "ms"; margin-left: 4px; font: 400 13px var(--sans);'
+            .. " letter-spacing: 0; color: var(--t3); }")
+    end
     if marks.graph then
-        table.insert(css, row(marks.graph) .. " { height: 58px; align-items: flex-start; background: " .. barLayers() .. "; }")
+        table.insert(css, row(marks.graph) .. " { padding-top: 62px; min-height: 18px; line-height: 18px;"
+            .. ' background: url("data:image/svg+xml;utf8,' .. chartSvg() .. '") 0 2px / 100% ' .. CHART_H .. "px no-repeat; }")
+        table.insert(css, row(marks.graph) .. " .wgc-k, " .. row(marks.graph) .. " .wgc-v { font-size: 11.5px; color: var(--t3); }")
+    end
+    if marks.section then
+        table.insert(css, row(marks.section) .. " { margin: 8px -12px 2px; padding: 8px 12px 0; border-top: 1px solid var(--l1); }")
+        table.insert(css, row(marks.section) .. " .wgc-k { font-weight: 550; color: var(--t2); }")
+        table.insert(css, row(marks.section) .. " .wgc-v { font: 11.5px var(--sans); color: var(--t3); }")
     end
     if marks.problem then table.insert(css, row(marks.problem) .. " .wgc-v { color: var(--bad); }") end
-    if marks.action then table.insert(css, row(marks.action) .. " .wgc-v { color: var(--accent); }") end
     if marks.foot then
-        table.insert(css, row(marks.foot) .. " { min-height: 18px; line-height: 18px; margin-top: 2px; }")
-        table.insert(css, row(marks.foot) .. " .wgc-k, " .. row(marks.foot) .. " .wgc-v { font-size: 11px; color: var(--t4); }")
+        table.insert(css, row(marks.foot) .. " { margin: 8px -12px -8px; padding: 7px 12px 8px; min-height: 18px;"
+            .. " line-height: 18px; border-top: 1px solid var(--l1); }")
+        table.insert(css, row(marks.foot) .. " .wgc-k { font: 11.5px var(--mono); color: var(--t3); }")
+        table.insert(css, row(marks.foot) .. " .wgc-v { font: 12px var(--sans); color: "
+            .. (marks.action and "var(--accent)" or "var(--t3)") .. "; }")
     end
     return table.concat(css, "\n")
 end

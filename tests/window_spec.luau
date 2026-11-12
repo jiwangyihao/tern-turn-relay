@@ -413,10 +413,11 @@ function cases.card_sheet_styles_the_rows_it_describes()
     f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', rtt_ms = 1200, detail = { fingerprint = 'relay-pin' } } }
     f:complete(f:value('ready', 'tls'))
     local sheet = f.sheets.card
-    assert(sheet and sheet:find('content: "TLS · 已连接"', 1, true), 'the hero badge names mode and phase')
-    assert(sheet:find('.wgc-row:nth-child(2) { height: 58px', 1, true), 'the graph row carries the columns')
-    local _, columns = sheet:gsub('linear%-gradient%(var%(%-%-warn%)', '')
-    assert(columns == 1, 'a slow sample draws one warning column')
+    assert(sheet and sheet:find('.wgc-head::after { content: "已连接"', 1, true), 'the head pill names the phase')
+    assert(sheet:find('radial-gradient(circle at 9px 50%, var(--warn)', 1, true), 'a slow connection tints the pill')
+    assert(f:view().title:match('^1200: TLS · server\n'), 'the hero pairs the latency figure with mode and target')
+    assert(sheet:find('.wgc-row:nth-child(2) { padding-top: 62px', 1, true) and sheet:find('data:image/svg+xml', 1, true),
+        'the graph row carries the chart')
     assert(f:view().tone == 'warn', 'a slow connection warns in the bar')
     f.time += 3000; f:flush()
     f:complete({ ok = false, error = 'control unavailable' }, 1)
