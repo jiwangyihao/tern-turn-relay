@@ -40,16 +40,16 @@ tern plugin install github.com/jiwangyihao/tern-turn-relay
 1. 打开 **TURN → Settings: server, Cloudflare Key and private runtime**。首次显式打开设置时，下载与插件版本一致的 Rust 程序，验证固定 SHA-256 和大小，存入私有目录；需要至少 256 MiB 空闲空间。
 2. 选择 **配置 Cloudflare TURN Key**。先在 [Cloudflare Realtime 控制台](https://dash.cloudflare.com/?to=/:account/calls) 创建自己的 TURN Key，再通过系统隐藏输入窗口填写 Key ID 和 **TURN-key API token**，不要填写账户级 API Token。验证成功后保存；取消或验证失败保留原凭据。
 3. 选择已有 SSH 别名。插件按远端架构下载并验证 Linux Rust helper，通过严格 SSH 放入远端私有缓存，再只读检查原服务、daemon 和实际 UDP 监听端口。不会启动第二个 session daemon；多个工作区可供选择。
-4. 阅读 **TURN 配置确认** 页，核对目标、工作区、网关目录、本机端口及 SSH 规则文件，再点击状态栏 **TURN · 确认配置**，选择 **确认应用**。
+4. 阅读 **TURN 配置确认** 页，核对目标、工作区、网关目录、本机端口及 SSH 规则文件，再点击底栏 **TURN Relay** 组件（显示 **TURN · 确认配置**）或再次打开 Settings，选择 **确认应用**。
 5. 选择 **连接 TURN TLS**。允许从本机 Host 或对应服务器 Host 发起；拒绝切换无关远端 Host，不自动回退直连。
 
 默认本机 UDP/TCP 端口为 `18377`。确有冲突时在 **高级：自定义本机端口** 修改，新端口会显示在确认页。更改运行中的配置前必须显式 Stop，向导不会擅自中断连接。
 
 Windows 请确认系统 OpenSSH 可读取当前用户的 SSH 配置、密钥与 known_hosts，不要把 Git Bash/WSL 的 SSH 配置误当原生配置。路径含空格或中文可用；向导按 argv 元素传参，不拼接 shell 命令。默认本机入口只绑定 `127.0.0.1`，不要开放到公网。下载不使用系统 HTTP 代理；企业网络需要能直接访问 GitHub HTTPS 发行资产、Cloudflare TURN TLS/UDP 与原 SSH 服务。不要通过关闭证书或身份验证绕过网络限制。
 
-## 从 0.4.x / 0.5.0–0.5.13 升级到 0.5.14
+## 从 0.4.x / 0.5.0–0.5.14 升级到 0.5.15
 
-先显式 Stop，再通过 Settings → 插件管理更新。新版本使用独立的 `native-runtime/0.5.14/`，准备失败不覆盖旧运行时、凭据或配置；配置和原网关/daemon 身份仍需通过检查，不会静默重新绑定。Windows 首次安装后必须先显式 Settings；普通 Status 查询不触发下载。显式 Stop 为保持旧版迁移兼容，可以先准备缺失的控制程序，失败时不会断开 Host 或假报已停止。所有实际原生命令都经 `--exec` 再次验证程序完整性；不能把文件存在或一次 Settings 成功当作后续执行授权。
+先显式 Stop，再通过 Settings → 插件管理更新。新版本使用独立的 `native-runtime/0.5.15/`，准备失败不覆盖旧运行时、凭据或配置；配置和原网关/daemon 身份仍需通过检查，不会静默重新绑定。Windows 首次安装后必须先显式 Settings；普通 Status 查询不触发下载。显式 Stop 为保持旧版迁移兼容，可以先准备缺失的控制程序，失败时不会断开 Host 或假报已停止。所有实际原生命令都经 `--exec` 再次验证程序完整性；不能把文件存在或一次 Settings 成功当作后续执行授权。
 
 ## 从 0.3.x 升级
 
@@ -71,7 +71,9 @@ Windows 请确认系统 OpenSSH 可读取当前用户的 SSH 配置、密钥与 
 | Stop TURN for ALL windows and SSH TCP sessions | 撤销自动恢复意图并停止共享后台，会中断经本机 TCP 入口的 SSH，不终止远端程序。 |
 | Status | 查询模式、原生 Host、SSH TCP、流量、队列、恢复状态及脱敏错误。 |
 
-状态栏流量按 1024 换算，是本次后台累计字节而非速率。历史丢包不等于当前拥塞。详情页可滚动、重复查询复用同一页。`ready` 表示后台就绪，不能替代原生 Host 已连接的验证；旧 `status.json` 也不是进程存活证明。
+状态显示在 **TURN Relay** 组件中（Tern 0.9.17 起）：命令面板 › Edit widgets… 把它放到窗口底栏，可选 `graph`（默认，文字前画 Tern 实测往返延迟折线，0–1000 ms 刻度，保留最近 120 次采样）或 `text` 样式。组件文字为模式与阶段，已连接时附当前往返延迟；悬停显示延迟中位数和最高值、后台状态与本机入口、flow/SSH TCP/排队、累计流量、网关重连、上行丢弃及脱敏异常。仅当 Tern 已放弃这台 Host（未连接或失败）时，点击按保存的模式经 TURN 重新连接；已连接、卡住或 Tern 自己重连中时点击不做任何操作，未配置时打开 Settings。更早的 Tern 没有组件接口，命令全部可用，只是不显示组件。
+
+流量按 1024 换算，是本次后台累计字节而非速率。历史丢包不等于当前拥塞。完整诊断（指纹、daemon、凭据到期等）用 **Status** 命令打开详情页，可滚动、重复查询复用同一页。`ready` 表示后台就绪，不能替代原生 Host 已连接的验证；旧 `status.json` 也不是进程存活证明。
 
 连接成功后保存的自动恢复意图同时决定后台寿命：只要意图仍与当前配置和模式一致，后台在没有任何 flow 或 SSH 的空闲期间也继续监听本机端口并维持预热网关，直到 Stop、恢复直连或系统重启。Tern 每次触发（启动、升级、切换 Host）只尝试连接一次且不自动重试，后台空闲退出会让之后的每次连接都失败。没有意图时，空闲 120 秒后仍自动退出。
 
@@ -123,7 +125,7 @@ TURN 不是普通 HTTP CDN。Rust 的原型测量显示进程内存和分发体�
 | Windows | 默认数据目录为 `%LOCALAPPDATA%\Tern\plugin-data\tern-turn-relay\`；插件代码位于 `%APPDATA%\Tern\plugins\tern-turn-relay\`，两者不是同一个目录。自定义 profile 以 Tern 实际传入并经核验的路径为准 |
 
 - `credentials/cloudflare.json`：Unix 使用目录 0700、文件 0600 的私有明文文件；Windows 保存用户级 DPAPI 密文，同时保留私有文件 DACL。Windows 密文不能直接复制给另一用户使用；旧明文文件不会静默加载，需在 Settings 显式重新配置，取消时保留原文件。输入文件仍须满足私有文件要求。
-- `native-runtime/0.5.14/`：经版本、大小和 SHA-256 校验的本机程序（Windows 为 `tern-turn-relay.exe`）与发行清单，以及按需下载的 Linux helper。
+- `native-runtime/0.5.15/`：经版本、大小和 SHA-256 校验的本机程序（Windows 为 `tern-turn-relay.exe`）与发行清单，以及按需下载的 Linux helper。
 - `config.json`、`installation.json`：非秘密配置及安装归属。
 - `runtime/`：生命周期锁、原生控制入口、状态和恢复意图。不要自行删除锁或按 PID/进程名杀进程来绕过检查。
 - Windows 私有资源在创建时使用当前用户、SYSTEM 与 Administrators 的受保护 DACL；本机仅接受规范的盘符绝对路径，远端路径仍为 POSIX。原子比较并替换使用 TxF 内核事务写锁、事务内私有暂存文件、`MoveFileTransacted` 与提交，避免检查后同名替换造成丢失更新；不采用「检查后 rename」或「先删除再重写」降级。

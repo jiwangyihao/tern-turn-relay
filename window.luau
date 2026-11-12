@@ -24,6 +24,10 @@ local lastError = nil
 local cache = { state = "stopped", mode = nil, bytes_up = 0, bytes_down = 0, flows = 0, ssh_connections = 0,
     queued_packets = 0, queued_bytes = 0, queue_dropped_packets = 0, queue_dropped_bytes = 0, congested = false }
 local statusText = "TURN · 已停止"
+-- Tern's own measured RTT of the dedicated Host, sampled once per poll for the widget.
+local RTT_KEEP = 120
+local RTT_SCALE_MS = 1000
+local rtt = { samples = {}, at = nil, last = nil, median = nil, max = nil }
 local schedule
 local inspectNative
 local disconnect
@@ -132,6 +136,7 @@ local function phaseLabel()
     if cache.state == "error" then return "不可用" end
     if cache.state ~= "ready" then return "已停止" end
     if nativeState == "connected" then return "已连接" end
+    if nativeState == "stalled" then return "卡住" end
     if nativeState == "reconnecting" then return "重连中" end
     if nativeState == "connecting" or pending then return "连接中" end
     return "未连接"
@@ -139,11 +144,28 @@ end
 
 local function refresh()
     statusText = "TURN" .. (cache.mode and " " .. string.upper(cache.mode) or "") .. " · " .. phaseLabel()
-    if cache.state == "ready" then
-        statusText ..= " · ↑" .. bytes(cache.bytes_up) .. " ↓" .. bytes(cache.bytes_down)
+    if cache.state == "ready" and nativeState == "connected" and rtt.last then
+        statusText ..= " · " .. string.format("%.0f", rtt.last) .. " ms"
     end
     statusText ..= lastError and " · 异常" or (cache.congested and " · 拥塞" or "")
     tern.chrome.refresh()
+end
+
+-- Formatters cannot call cx, so the poll records Tern's RTT for the widget. Only a
+-- connected Host's measurement counts; a stalled or lost one would graph stale values.
+local function recordRtt(host)
+    local now = tern.now()
+    if rtt.at and now - rtt.at < POLL_MS / 2 then return end
+    rtt.at = now
+    local ms = host and host.state == "connected" and host.rtt_ms
+    if type(ms) ~= "number" or ms < 0 or ms >= math.huge then rtt.last = nil; return end
+    rtt.last = ms
+    table.insert(rtt.samples, ms)
+    if #rtt.samples > RTT_KEEP then table.remove(rtt.samples, 1) end
+    local sorted = table.clone(rtt.samples)
+    table.sort(sorted)
+    rtt.median = sorted[(#sorted + 1) // 2]
+    rtt.max = sorted[#sorted]
 end
 
 local function report(cx, message)
@@ -445,6 +467,7 @@ inspectNative = function(cx)
         return
     end
     nativeState = host and host.state or (request and "connecting" or "disconnected")
+    if not request then recordRtt(host) end
     if request then
         mayFocus(cx, request)
         if tern.now() >= request.deadline then queueNative(request, request.phase) end
@@ -1024,11 +1047,66 @@ tern.command({ id = "restore-direct", title = "Restore configured Host to direct
 tern.command({ id = "disconnect", title = "Stop TURN for ALL windows and SSH TCP sessions (interrupts TCP)", group = "TURN", run = commandTick(disconnect) })
 tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, bytes and errors", group = "TURN", run = commandTick(status) })
 
+-- Clicking reconnects only a Host Tern has given up on; it never interrupts a live,
+-- stalled or reconnecting one, and never runs while another operation is pending.
+local function clickAction(reviewing)
+    if reviewing or not hasConfig or not helperReady then return "plugin.tern-turn-relay.setup", "打开 TURN 设置" end
+    if busy or pending or (nativeState ~= "disconnected" and nativeState ~= "failed") then return nil, nil end
+    local mode = cache.mode or cache.resume_mode or "udp"
+    return "plugin.tern-turn-relay.convert-" .. mode, "经 TURN " .. string.upper(mode) .. " 连接"
+end
+
+local function tooltip(reviewing, action)
+    local lines = { reviewing and "TURN · 等待确认配置" or statusText }
+    if rtt.median then
+        table.insert(lines, string.format("Tern 实测往返：%s（近 %d 次中位 %.0f ms，最高 %.0f ms）",
+            rtt.last and string.format("%.0f ms", rtt.last) or "—", #rtt.samples, rtt.median, rtt.max))
+    end
+    if hasConfig then
+        table.insert(lines, "后台：" .. cache.state .. (cache.address and " · 入口 " .. cache.address or ""))
+        table.insert(lines, string.format("连接：TURN flow %d · SSH TCP %d · 排队 %d 包", cache.flows, cache.ssh_connections, cache.queued_packets))
+        table.insert(lines, "流量：↑" .. bytes(cache.bytes_up) .. " ↓" .. bytes(cache.bytes_down))
+        if cache.gateway_recovering or (cache.gateway_reconnects or 0) > 0 then
+            table.insert(lines, string.format("网关：%s · 已重连 %d 次", cache.gateway_recovering and "恢复中" or "正常", cache.gateway_reconnects or 0))
+        end
+        if cache.queue_dropped_packets > 0 then
+            table.insert(lines, string.format("累计上行丢弃：%d 包", cache.queue_dropped_packets))
+        end
+        if cache.recovery_error then table.insert(lines, "等待原因：" .. cache.recovery_error:gsub("[%c]", " ")) end
+    end
+    local problem = lastError or cache.error
+    if problem then table.insert(lines, "异常：" .. problem:gsub("[%c]", " ")) end
+    if action then table.insert(lines, "点击：" .. action) end
+    return table.concat(lines, "\n")
+end
+
 -- Chrome is pure: cache only, never process spawning, file reads or native Host calls.
-tern.chrome.status(function()
-    local reviewing = onboarding and onboarding.reviewed ~= nil
-    return { { text = reviewing and "TURN · 确认配置" or statusText, tone = lastError and "error" or ((cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0) and "warn" or "muted"), command = (reviewing or not hasConfig or not helperReady) and "plugin.tern-turn-relay.setup" or "plugin.tern-turn-relay.status" } }
-end)
+-- Widgets exist from Tern 0.9.17; older Tern keeps every command, just no widget.
+if tern.chrome.widget then
+tern.chrome.widget("turn", {
+    name = "TURN Relay",
+    description = "TURN 状态与 Tern 实测往返延迟；悬停看详情，Tern 放弃连接后点击重连",
+    icon = "broadcast",
+    styles = { "graph", "text" },
+    render = function()
+        local reviewing = onboarding and onboarding.reviewed ~= nil
+        local command, action = clickAction(reviewing)
+        local series = nil
+        if #rtt.samples > 0 then
+            series = table.create(#rtt.samples)
+            for index, ms in ipairs(rtt.samples) do series[index] = math.min(ms / RTT_SCALE_MS, 1) end
+        end
+        return {
+            text = reviewing and "TURN · 确认配置" or statusText,
+            tone = lastError and "error" or ((cache.gateway_recovering or cache.congested
+                or (cache.recovering_flows or 0) > 0 or nativeState == "stalled") and "warn" or "muted"),
+            title = tooltip(reviewing, action),
+            command = command,
+            series = series,
+        }
+    end,
+})
+end
 
 -- A plugin reload need not emit window_start, and headless timer clocks may be
 -- paused. One asynchronous status query supplies the fresh owner context on load.

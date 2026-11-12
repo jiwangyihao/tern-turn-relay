@@ -2,7 +2,7 @@ local install = require('../window')
 local cases = {}
 
 local function fixture(os, configured, installed)
-    local f = { calls = {}, commands = {}, timers = {}, time = 0, mutations = 0, toasts = {}, details = '', hosts = {}, reads = {}, kv = {} }
+    local f = { calls = {}, commands = {}, timers = {}, time = 0, mutations = 0, toasts = {}, details = '', hosts = {}, reads = {}, kv = {}, widgets = {} }
     f.config = { schema = 4, ssh_destination = 'server', listen_port = 18377,
         target = { name = 'server', host = '203.0.113.1', user = 'user', port = 22, fingerprint = 'original-pin' },
         gateway = { fingerprint = 'relay-pin', daemon_socket = '/private/daemon.sock' } }
@@ -52,8 +52,9 @@ local function fixture(os, configured, installed)
                 f.interruptRefresh = false
                 error('simulated interrupted timer hook')
             end
-        end, status = function(callback) f.status = callback end },
+        end, widget = function(id, spec) f.widgets[id] = spec end },
     }
+    function f:view() return self.widgets.turn.render(nil) end
     function f:context()
         local function mutate() self.mutations += 1; error('不应修改 Host') end
         return {
@@ -134,7 +135,7 @@ function cases.stop_preparation_failure_is_not_success()
         f:command('disconnect')
         assert(#f.calls == 1 and f.calls[1].argv[#f.calls[1].argv] == '--prepare')
         f:complete({ ok = false }, 1)
-        assert(#f.calls == 1 and f.mutations == 0 and f.status()[1].tone == 'error')
+        assert(#f.calls == 1 and f.mutations == 0 and f:view().tone == 'error')
         f:command('status')
         assert(#f.calls == 1 and f.mutations == 0)
         for _, toast in ipairs(f.toasts) do assert(not toast:find('TURN stopped for ALL', 1, true)) end
@@ -149,9 +150,9 @@ function cases.stop_bad_runtime_identity_and_timeout_preserve_hosts()
             f.time = 322001
             assert(f:tick())
         else
-            f:complete({ ok = true, runtime_ready = true, version = '0.5.14', binary = 'C:/wrong.exe' })
+            f:complete({ ok = true, runtime_ready = true, version = '0.5.15', binary = 'C:/wrong.exe' })
         end
-        assert(#f.calls == 1 and f.mutations == 0 and f.status()[1].tone == 'error')
+        assert(#f.calls == 1 and f.mutations == 0 and f:view().tone == 'error')
         f:command('status')
         assert(#f.calls == 1 and f.mutations == 0)
     end
@@ -160,7 +161,7 @@ end
 function cases.successful_prepare_still_requires_real_stop_result()
     local f = fixture('windows', true)
     f:command('disconnect')
-    f:complete({ ok = true, runtime_ready = true, version = '0.5.14', binary = 'C:/用户/data/native-runtime/0.5.14/tern-turn-relay.exe' })
+    f:complete({ ok = true, runtime_ready = true, version = '0.5.15', binary = 'C:/用户/data/native-runtime/0.5.15/tern-turn-relay.exe' })
     assert(#f.calls == 2 and f.calls[2].argv[10] == '--exec' and f.calls[2].argv[11] == 'relay' and f.calls[2].argv[12] == 'stop')
     assert(f.mutations == 0)
     f:complete({ ok = true, state = 'stopped' }) -- 缺失状态 schema，不能伪报成功。
@@ -175,7 +176,7 @@ function cases.existing_runtime_is_never_execution_authority()
         local offset = os == 'windows' and 10 or 4
         assert(argv[offset] == '--exec' and argv[offset + 1] == 'relay' and argv[offset + 2] == 'status')
         f:complete({ ok = false, error = 'verification failed' }, 1)
-        assert(f.mutations == 0 and f.status()[1].tone == 'error')
+        assert(f.mutations == 0 and f:view().tone == 'error')
         f:command('disconnect')
         assert(f.calls[2].argv[offset] == '--exec' and f.calls[2].argv[offset + 2] == 'stop')
         f:complete({ ok = false }, 1)
@@ -213,12 +214,12 @@ function cases.periodic_status_is_live_deduplicated_and_failure_invalidates_read
     f:command('status'); f:command('status')
     assert(#f.calls == 2, '并发 Status 不得重复查询')
     f:complete({ ok = false, error = 'control unavailable' }, 1)
-    assert(f.status()[1].text:find('不可用') and not f.status()[1].text:find('已连接'))
+    assert(f:view().text:find('不可用') and not f:view().text:find('已连接'))
     assert(f.details:find('error', 1, true), '等待中的详情订阅应显示实时失败结果')
     assert(f.mutations == 0)
     for _, path in ipairs(f.reads) do assert(not path:find('status.json', 1, true)) end
     f:command('status'); f:complete(f:value('ready'))
-    assert(f.status()[1].text:find('已连接'))
+    assert(f:view().text:find('已连接'))
 end
 
 function cases.disconnected_host_does_not_freeze_recovery_status()
@@ -229,13 +230,13 @@ function cases.disconnected_host_does_not_freeze_recovery_status()
         local recovering = f:value('ready')
         recovering.recovering_flows = 1
         f:complete(recovering)
-        assert(f.status()[1].text:find('恢复中'))
+        assert(f:view().text:find('恢复中'))
         -- Native Tern reconnects independently; no plugin command wakes polling.
         f.hosts[1].state = 'connected'
         f.time = 3000; f:flush()
         assert(#f.calls == 2, '断开期间不能停止读取后台状态，否则恢复文字会永久冻结')
         f:complete(f:value('ready'))
-        assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('恢复中'))
+        assert(f:view().text:find('已连接') and not f:view().text:find('恢复中'))
         assert(f.mutations == 0, '观察恢复不能修改原生 Host')
     end
 end
@@ -253,10 +254,10 @@ function cases.interrupted_refresh_does_not_stop_future_status_observation()
     local recovering = f:value('ready')
     recovering.recovering_flows = 1
     f:complete(recovering)
-    assert(f.status()[1].text:find('恢复中'), '中断后必须继续反映真实状态变化')
+    assert(f:view().text:find('恢复中'), '中断后必须继续反映真实状态变化')
     f.time = 9000; f:flush()
     f:complete(f:value('ready'))
-    assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('恢复中'))
+    assert(f:view().text:find('已连接') and not f:view().text:find('恢复中'))
     assert(f.mutations == 0)
 end
 
@@ -267,10 +268,10 @@ function cases.live_status_timeout_discards_late_ready()
     f.time = 3000; f:flush()
     local late = f.calls[2].callback
     f.time = 20001; f:flush()
-    assert(f.status()[1].text:find('不可用'))
+    assert(f:view().text:find('不可用'))
     f.response = f:value('ready'); late({ stdout = '{}', status = 0 }, {})
     f:flush()
-    assert(f.status()[1].text:find('不可用') and f.mutations == 0)
+    assert(f:view().text:find('不可用') and f.mutations == 0)
 end
 
 function cases.failed_observation_recovers_without_user_command()
@@ -284,13 +285,13 @@ function cases.failed_observation_recovers_without_user_command()
             end
             for _ = 1, 2 do
                 f:complete({ ok = false, error = 'control unavailable' }, 1)
-                assert(f.status()[1].text:find('不可用'))
+                assert(f:view().text:find('不可用'))
                 local previous = #f.calls
                 f.time += 3000; f:flush()
                 assert(#f.calls == previous + 1, '状态查询失败后必须继续观察，不依赖手工 Status')
             end
             f:complete(f:value('ready'))
-            assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('异常'))
+            assert(f:view().text:find('已连接') and not f:view().text:find('异常'))
             assert(f.mutations == 0, '查询恢复不能启动后台或修改 Host')
         end
     end
@@ -304,7 +305,7 @@ function cases.stop_generation_discards_previous_status()
     f:complete(f:value('stopped'))
     f.response = f:value('ready'); late({ stdout = '{}', status = 0 }, {})
     f:flush()
-    assert(f.status()[1].text:find('已停止') and f.mutations == 0)
+    assert(f:view().text:find('已停止') and f.mutations == 0)
 end
 
 function cases.aborted_status_delivery_expires_without_reload_or_user_command()
@@ -314,7 +315,7 @@ function cases.aborted_status_delivery_expires_without_reload_or_user_command()
     local recovering = f:value('ready')
     recovering.gateway_recovering = true
     f:complete(recovering)
-    assert(f.status()[1].text:find('恢复中'))
+    assert(f:view().text:find('恢复中'))
     f.time = 3000; f:flush()
     f.abortDecode = true
     f.abortTimerHook = true
@@ -322,7 +323,7 @@ function cases.aborted_status_delivery_expires_without_reload_or_user_command()
     for _ = 1, 8 do f.time += 3000; f:flush() end
     assert(#f.calls >= 3, '宿主中断结果交付后必须自动过期悬挂查询，不能永远冻结恢复状态')
     f:complete(f:value('ready'))
-    assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('恢复中'))
+    assert(f:view().text:find('已连接') and not f:view().text:find('恢复中'))
     assert(f.mutations == 0, '恢复观察不能修改 Host 或重启后台')
 end
 
@@ -365,9 +366,44 @@ function cases.clean_restore_revokes_auto_recovery_only_after_alias_detaches()
         else
             assert(released and f.calls[#f.calls].argv[6] == 'release', 'clean restore must revoke auto-recovery')
             f:complete(f:value('ready'))
-            assert(f.status()[1].tone ~= 'error')
+            assert(f:view().tone ~= 'error')
         end
     end
+end
+
+function cases.widget_graphs_tern_rtt_and_reconnects_only_a_host_tern_gave_up()
+    assert(fixture('macos', false):view().command == 'plugin.tern-turn-relay.setup')
+    local f = fixture('macos', true, true)
+    local host = { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', rtt_ms = 300, detail = { fingerprint = 'relay-pin' } }
+    f.hosts = { host }
+    f:complete(f:value('ready', 'tls'))
+    for _, ms in ipairs({ 1500, 450 }) do
+        host.rtt_ms = ms
+        f.time += 3000; f:flush()
+        f:complete(f:value('ready', 'tls'))
+    end
+    local view = f:view()
+    assert(#view.series == 3 and view.series[1] == 0.3 and view.series[2] == 1 and view.series[3] == 0.45,
+        'RTT graph keeps samples oldest first, clamped to the scale')
+    assert(view.text:find('已连接', 1, true) and view.text:find('450 ms', 1, true))
+    assert(view.title:find('中位 450 ms', 1, true) and view.title:find('最高 1500 ms', 1, true))
+    assert(view.command == nil, 'a connected Host is never reconnected by a click')
+    for _, state in ipairs({ 'stalled', 'reconnecting' }) do
+        host.state = state; host.rtt_ms = nil
+        f.time += 3000; f:flush()
+        f:complete(f:value('ready', 'tls'))
+        assert(f:view().command == nil, state .. ' must not be interrupted')
+        assert(not f:view().text:find(' ms', 1, true), 'no stale RTT while ' .. state)
+    end
+    host.state = 'stalled'
+    f.time += 3000; f:flush()
+    f:complete(f:value('ready', 'tls'))
+    assert(f:view().text:find('卡住', 1, true) and f:view().tone == 'warn')
+    host.state = 'failed'
+    f.time += 3000; f:flush()
+    f:complete(f:value('ready', 'tls'))
+    assert(f:view().command == 'plugin.tern-turn-relay.convert-tls', 'a Host Tern gave up on reconnects in its saved mode')
+    assert(f.mutations == 0)
 end
 
 return { run = function()
