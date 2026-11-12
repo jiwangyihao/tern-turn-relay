@@ -1,8 +1,8 @@
 local install = require('../window')
 local cases = {}
 
-local function fixture(os, configured, installed)
-    local f = { calls = {}, commands = {}, timers = {}, time = 0, mutations = 0, toasts = {}, details = '', hosts = {}, reads = {}, kv = {}, widgets = {} }
+local function fixture(os, configured, installed, kv)
+    local f = { calls = {}, commands = {}, timers = {}, time = 0, mutations = 0, toasts = {}, details = '', hosts = {}, reads = {}, kv = kv or {}, widgets = {}, events = {}, sheets = {} }
     f.config = { schema = 4, ssh_destination = 'server', listen_port = 18377,
         target = { name = 'server', host = '203.0.113.1', user = 'user', port = 22, fingerprint = 'original-pin' },
         gateway = { fingerprint = 'relay-pin', daemon_socket = '/private/daemon.sock' } }
@@ -46,6 +46,8 @@ local function fixture(os, configured, installed)
         end },
         process = { run = function(argv, options, callback) table.insert(f.calls, { argv = argv, options = options, callback = callback }) end },
         kv = { get = function(key) return f.kv[key] end, set = function(key, value) f.kv[key] = value end },
+        on = function(name, handler) f.events[name] = handler end,
+        css = function(name, source) f.sheets[name] = source end,
         command = function(command) f.commands[command.id] = command end,
         chrome = { refresh = function()
             if f.interruptRefresh then
@@ -383,10 +385,10 @@ function cases.widget_graphs_tern_rtt_and_reconnects_only_a_host_tern_gave_up()
         f:complete(f:value('ready', 'tls'))
     end
     local view = f:view()
-    assert(#view.series == 3 and view.series[1] == 0.3 and view.series[2] == 1 and view.series[3] == 0.45,
-        'RTT graph keeps samples oldest first, clamped to the scale')
-    assert(view.text:find('已连接', 1, true) and view.text:find('450 ms', 1, true))
-    assert(view.title:find('中位 450 ms', 1, true) and view.title:find('最高 1500 ms', 1, true))
+    assert(#view.series == 3 and view.series[1] == 0.2 and view.series[2] == 1 and view.series[3] == 0.3,
+        'RTT graph keeps samples oldest first, scaled to the peak')
+    assert(view.text == '450 ms', 'a connected bar shows only its latency')
+    assert(view.title:find('中位 450 · 峰值 1500 ms', 1, true))
     assert(view.command == nil, 'a connected Host is never reconnected by a click')
     for _, state in ipairs({ 'stalled', 'reconnecting' }) do
         host.state = state; host.rtt_ms = nil
@@ -404,6 +406,65 @@ function cases.widget_graphs_tern_rtt_and_reconnects_only_a_host_tern_gave_up()
     f:complete(f:value('ready', 'tls'))
     assert(f:view().command == 'plugin.tern-turn-relay.convert-tls', 'a Host Tern gave up on reconnects in its saved mode')
     assert(f.mutations == 0)
+end
+
+function cases.card_sheet_styles_the_rows_it_describes()
+    local f = fixture('macos', true, true)
+    f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', rtt_ms = 1200, detail = { fingerprint = 'relay-pin' } } }
+    f:complete(f:value('ready', 'tls'))
+    local sheet = f.sheets.card
+    assert(sheet and sheet:find('content: "TLS · 已连接"', 1, true), 'the hero badge names mode and phase')
+    assert(sheet:find('.wgc-row:nth-child(2) { height: 58px', 1, true), 'the graph row carries the columns')
+    local _, columns = sheet:gsub('linear%-gradient%(var%(%-%-warn%)', '')
+    assert(columns == 1, 'a slow sample draws one warning column')
+    assert(f:view().tone == 'warn', 'a slow connection warns in the bar')
+    f.time += 3000; f:flush()
+    f:complete({ ok = false, error = 'control unavailable' }, 1)
+    local problem
+    local index = 0
+    for line in (f:view().title .. '\n'):gmatch('(.-)\n') do
+        index += 1
+        if line:find('^异常: ') then problem = index end
+    end
+    assert(problem and f.sheets.card:find('.wgc-row:nth-child(' .. problem .. ') .wgc-v { color: var(--bad); }', 1, true),
+        'the error value is red on its own row')
+    assert(f:view().tone == 'error')
+end
+
+function cases.lost_poll_is_rearmed_by_window_events_and_budget_resume()
+    for _, trigger in ipairs({ 'focus', 'budget' }) do
+        local f = fixture('macos', true, true)
+        f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', detail = { fingerprint = 'relay-pin' } } }
+        f:complete(f:value('ready'))
+        for _, armed in ipairs(f.timers) do armed.active = false end
+        f.time = 12000; f:flush()
+        local before = #f.calls
+        assert(before == 1, 'a poll that never fires stops observation')
+        if trigger == 'focus' then
+            f.events.focus({ pane = 1, tab = 1 }, f:context())
+        else
+            f.events.budget({ hook = 'timer', state = 'resumed' }, f:context())
+        end
+        f.time = 15000; f:flush()
+        assert(#f.calls == before + 1, trigger .. ' must re-arm the overdue poll')
+    end
+end
+
+function cases.rtt_history_survives_a_new_vm_and_expires()
+    local now = os.time()
+    local f = fixture('macos', true, true, { ['rtt-history'] = { { t = now - 1000, ms = 999 }, { t = now - 30, ms = 400 }, { t = now - 27, ms = 500 } } })
+    local view = f:view()
+    assert(view.series and #view.series == 2, 'recent history graphs at once; expired samples are dropped')
+    assert(view.title:find('中位 400 · 峰值 500 ms', 1, true))
+    local host = { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', rtt_ms = 350, detail = { fingerprint = 'relay-pin' } }
+    f.hosts = { host }
+    f:complete(f:value('ready'))
+    for _ = 1, 9 do
+        f.time += 3000; f:flush()
+        f:complete(f:value('ready'))
+    end
+    local saved = f.kv['rtt-history']
+    assert(saved and #saved == 12 and saved[#saved].ms == 350, 'ten new samples are saved for the next VM')
 end
 
 return { run = function()

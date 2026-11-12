@@ -24,10 +24,19 @@ local lastError = nil
 local cache = { state = "stopped", mode = nil, bytes_up = 0, bytes_down = 0, flows = 0, ssh_connections = 0,
     queued_packets = 0, queued_bytes = 0, queue_dropped_packets = 0, queue_dropped_bytes = 0, congested = false }
 local statusText = "TURN · 已停止"
--- Tern's own measured RTT of the dedicated Host, sampled once per poll for the widget.
+-- Tern's own measured RTT of the dedicated Host: one sample per poll, kept in tern.kv so
+-- a reload or a new window starts with the recent graph instead of an empty one.
 local RTT_KEEP = 120
-local RTT_SCALE_MS = 1000
-local rtt = { samples = {}, at = nil, last = nil, median = nil, max = nil }
+local RTT_WINDOW_S = 360
+local RTT_BARS = 30
+local RTT_FLOOR_MS = 600
+local RTT_SLOW_MS = 800
+local RTT_KV = "rtt-history"
+local rtt = { samples = {}, at = nil, last = nil, median = nil, max = nil, unsaved = 0 }
+local pollDue = nil
+local lastStatusAt = nil
+local installedCss = nil
+local paint
 local schedule
 local inspectNative
 local disconnect
@@ -47,6 +56,40 @@ do
     helperReady = ready and installed
     -- Existence is only a UI/preparation hint; every execution revalidates via bootstrap.
     if not hasConfig then statusText = "TURN · 待配置" elseif not helperReady then statusText = "TURN · 待升级" end
+end
+
+local function rttStats()
+    local sorted = table.create(#rtt.samples)
+    for index, sample in ipairs(rtt.samples) do sorted[index] = sample.ms end
+    table.sort(sorted)
+    rtt.median = sorted[(#sorted + 1) // 2]
+    rtt.max = sorted[#sorted]
+end
+
+local function trimRtt(now)
+    while #rtt.samples > RTT_KEEP or (rtt.samples[1] and rtt.samples[1].t < now - RTT_WINDOW_S) do
+        table.remove(rtt.samples, 1)
+    end
+end
+
+local function saveRtt()
+    rtt.unsaved = 0
+    pcall(tern.kv.set, RTT_KV, rtt.samples)
+end
+
+do
+    local ok, saved = pcall(tern.kv.get, RTT_KV)
+    local now = os.time()
+    if ok and type(saved) == "table" then
+        for _, sample in ipairs(saved) do
+            if type(sample) == "table" and type(sample.t) == "number" and sample.t <= now
+                and type(sample.ms) == "number" and sample.ms >= 0 and sample.ms < math.huge then
+                table.insert(rtt.samples, { t = sample.t, ms = sample.ms })
+            end
+        end
+        trimRtt(now)
+    end
+    rttStats()
 end
 
 local function text(value, max)
@@ -143,12 +186,7 @@ local function phaseLabel()
 end
 
 local function refresh()
-    statusText = "TURN" .. (cache.mode and " " .. string.upper(cache.mode) or "") .. " · " .. phaseLabel()
-    if cache.state == "ready" and nativeState == "connected" and rtt.last then
-        statusText ..= " · " .. string.format("%.0f", rtt.last) .. " ms"
-    end
-    statusText ..= lastError and " · 异常" or (cache.congested and " · 拥塞" or "")
-    tern.chrome.refresh()
+    if paint then paint() else tern.chrome.refresh() end
 end
 
 -- Formatters cannot call cx, so the poll records Tern's RTT for the widget. Only a
@@ -160,21 +198,22 @@ local function recordRtt(host)
     local ms = host and host.state == "connected" and host.rtt_ms
     if type(ms) ~= "number" or ms < 0 or ms >= math.huge then rtt.last = nil; return end
     rtt.last = ms
-    table.insert(rtt.samples, ms)
-    if #rtt.samples > RTT_KEEP then table.remove(rtt.samples, 1) end
-    local sorted = table.clone(rtt.samples)
-    table.sort(sorted)
-    rtt.median = sorted[(#sorted + 1) // 2]
-    rtt.max = sorted[#sorted]
+    local wall = os.time()
+    table.insert(rtt.samples, { t = wall, ms = ms })
+    trimRtt(wall)
+    rttStats()
+    rtt.unsaved += 1
+    if rtt.unsaved >= 10 then saveRtt() end
 end
 
 local function report(cx, message)
     lastError = message:gsub("[%c]", " ")
     refresh()
-    if cx then cx:toast("error", "TURN 异常", "点击状态栏查看详情") end
+    if cx then cx:toast("error", "TURN 异常", "悬停底栏 TURN Relay 组件查看详情") end
 end
 
 local function accept(value)
+    lastStatusAt = os.time()
     local previousError = cache.error
     cache = value
     if value.address then alias = value.address end
@@ -480,8 +519,10 @@ schedule = function()
     if timer or not (pending or busy or cache.state == "ready" or cache.state == "starting"
         or (hasConfig and helperReady and cache.state == "error")) then return end
     local token = generation
+    pollDue = tern.now() + POLL_MS
     timer = tern.timer(POLL_MS, function(_fresh)
         timer = nil
+        pollDue = nil
         if token ~= generation then schedule(); return end
         -- Keep the next observation armed before queued/native work can exhaust
         -- a timer hook's budget. Recovery must not depend on callback completion.
@@ -503,6 +544,19 @@ schedule = function()
             end, "poll")
         end)
     end)
+end
+
+-- A poll that never fired (a hook cut off mid-call, a lost timer) must not freeze the
+-- card until a reload: independent window hooks re-arm one that is long overdue.
+local function revive()
+    if timer and pollDue and tern.now() > pollDue + 2 * POLL_MS then
+        local stale = timer
+        timer = nil
+        pollDue = nil
+        pcall(function() stale:cancel() end)
+        runner:wake()
+    end
+    if not timer then schedule() end
 end
 
 -- A clean restore means the TURN alias is no longer the selected route. Revoke
@@ -1022,16 +1076,18 @@ onboarding = require('./onboarding').new({
     available = function() return not busy and not pending end,
     runtimeReady = function(path) if path == nativeBinary then helperReady = true end end,
     configured = function() hasConfig = true; lastError = nil; refresh() end,
-    reviewChanged = function() tern.chrome.refresh() end,
+    reviewChanged = function() refresh() end,
     failed = function(message)
         setupError = message:gsub("[%c]", " ")
         lastError = setupError
-        if hasConfig then refresh() else statusText = "TURN · 配置失败"; tern.chrome.refresh() end
+        if not hasConfig then statusText = "TURN · 配置失败" end
+        refresh()
     end,
     inspected = function()
         if setupError and lastError == setupError then lastError = nil end
         setupError = nil
-        if hasConfig then refresh() else statusText = "TURN · 待配置"; tern.chrome.refresh() end
+        if not hasConfig then statusText = "TURN · 待配置" end
+        refresh()
     end,
     connect = function(cx) convert("tls", cx, true) end,
     status = status,
@@ -1049,35 +1105,154 @@ tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, 
 
 -- Clicking reconnects only a Host Tern has given up on; it never interrupts a live,
 -- stalled or reconnecting one, and never runs while another operation is pending.
-local function clickAction(reviewing)
-    if reviewing or not hasConfig or not helperReady then return "plugin.tern-turn-relay.setup", "打开 TURN 设置" end
+local function clickAction(review)
+    if review or not hasConfig or not helperReady then return "plugin.tern-turn-relay.setup", "打开 TURN 设置" end
     if busy or pending or (nativeState ~= "disconnected" and nativeState ~= "failed") then return nil, nil end
     local mode = cache.mode or cache.resume_mode or "udp"
     return "plugin.tern-turn-relay.convert-" .. mode, "经 TURN " .. string.upper(mode) .. " 连接"
 end
 
-local function tooltip(reviewing, action)
-    local lines = { reviewing and "TURN · 等待确认配置" or statusText }
-    if rtt.median then
-        table.insert(lines, string.format("Tern 实测往返：%s（近 %d 次中位 %.0f ms，最高 %.0f ms）",
-            rtt.last and string.format("%.0f ms", rtt.last) or "—", #rtt.samples, rtt.median, rtt.max))
+local BACKEND = { ready = "就绪", starting = "启动中", stopped = "已停止", error = "不可用" }
+local CARD = '.kit-popover.wgc[data-widget="tern-turn-relay/turn"]'
+local BADGE = {
+    ok = { "var(--ok)", "rgb(from var(--ok) r g b / 14%)" },
+    warn = { "var(--t1)", "rgb(from var(--warn) r g b / 16%)" },
+    bad = { "var(--t1)", "rgb(from var(--bad) r g b / 14%)" },
+}
+
+local function reviewing()
+    return onboarding ~= nil and onboarding.reviewed ~= nil
+end
+
+local function connectedRtt()
+    return cache.state == "ready" and nativeState == "connected" and rtt.last or nil
+end
+
+-- The bar's word and the card's hero: the latency while connected, else the phase.
+local function headline(review)
+    if review then return "确认配置" end
+    if not hasConfig or not helperReady then return (statusText:gsub("^TURN · ", "")) end
+    local ms = connectedRtt()
+    return ms and string.format("%.0f ms", ms) or phaseLabel()
+end
+
+local function barText(review)
+    if review then return "TURN · 确认配置" end
+    if not hasConfig or not helperReady then return statusText end
+    return headline(review)
+end
+
+-- "ok", "warn", "bad" or nil (neutral): the bar tone, the hero color and the badge.
+local function health()
+    if lastError then return "bad" end
+    if cache.gateway_recovering or cache.congested or (cache.recovering_flows or 0) > 0
+        or nativeState == "stalled" or (connectedRtt() or 0) >= RTT_SLOW_MS then return "warn" end
+    if cache.state == "ready" and nativeState == "connected" then return "ok" end
+    return nil
+end
+
+local function span(seconds)
+    if seconds < 90 then return string.format("近 %d 秒", math.max(1, seconds)) end
+    return string.format("近 %d 分钟", math.floor(seconds / 60 + 0.5))
+end
+
+-- The card is the `title` rows Tern draws; a "key: value" line becomes two columns. The
+-- marks name the rows the card sheet styles: hero, graph, problem, action and foot.
+local function cardRows(review, action)
+    local rows, marks = {}, {}
+    local function add(line) table.insert(rows, (line:gsub("[%c]", " "))); return #rows end
+    local function pair(key, value)
+        local shown = string.gsub(tostring(value), ": ", "：")
+        return add(key .. ": " .. shown)
     end
-    if hasConfig then
-        table.insert(lines, "后台：" .. cache.state .. (cache.address and " · 入口 " .. cache.address or ""))
-        table.insert(lines, string.format("连接：TURN flow %d · SSH TCP %d · 排队 %d 包", cache.flows, cache.ssh_connections, cache.queued_packets))
-        table.insert(lines, "流量：↑" .. bytes(cache.bytes_up) .. " ↓" .. bytes(cache.bytes_down))
-        if cache.gateway_recovering or (cache.gateway_reconnects or 0) > 0 then
-            table.insert(lines, string.format("网关：%s · 已重连 %d 次", cache.gateway_recovering and "恢复中" or "正常", cache.gateway_reconnects or 0))
+    marks.hero = add(headline(review))
+    if #rtt.samples > 0 then
+        marks.graph = pair(span(os.time() - rtt.samples[1].t),
+            string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max))
+    end
+    if hasConfig and not review then
+        local endpoint = cache.address and cache.address:match("@(.+)$")
+        if cache.mode then pair("传输", string.upper(cache.mode) .. (endpoint and " · " .. endpoint or "")) end
+        pair("后台", BACKEND[cache.state] or cache.state)
+        pair("连接", string.format("TURN %d · SSH %d", cache.flows, cache.ssh_connections))
+        pair("流量", "↑" .. bytes(cache.bytes_up) .. " ↓" .. bytes(cache.bytes_down))
+        if cache.queued_packets > 0 then pair("排队", string.format("%d 包 · %s", cache.queued_packets, bytes(cache.queued_bytes))) end
+        if cache.queue_dropped_packets > 0 then pair("上行丢弃", string.format("%d 包", cache.queue_dropped_packets)) end
+        if cache.gateway_recovering then
+            pair("网关", string.format("恢复中 · 第 %d 次", cache.gateway_reconnects or 0))
+        elseif (cache.gateway_reconnects or 0) > 0 then
+            pair("网关", string.format("正常 · 已重连 %d 次", cache.gateway_reconnects))
         end
-        if cache.queue_dropped_packets > 0 then
-            table.insert(lines, string.format("累计上行丢弃：%d 包", cache.queue_dropped_packets))
-        end
-        if cache.recovery_error then table.insert(lines, "等待原因：" .. cache.recovery_error:gsub("[%c]", " ")) end
+        if cache.recovery_error then pair("等待原因", cache.recovery_error) end
     end
     local problem = lastError or cache.error
-    if problem then table.insert(lines, "异常：" .. problem:gsub("[%c]", " ")) end
-    if action then table.insert(lines, "点击：" .. action) end
-    return table.concat(lines, "\n")
+    if problem then marks.problem = pair("异常", problem) end
+    if action then marks.action = pair("点击", action) end
+    if lastStatusAt and hasConfig then marks.foot = pair("更新于", os.date("%H:%M:%S", lastStatusAt)) end
+    return rows, marks
+end
+
+local function quoted(value)
+    local escaped = string.gsub(value, '[\\"]', "\\%0")
+    return '"' .. escaped .. '"'
+end
+
+-- Columns like the CPU widget's: each the peak of its slice of the history, oldest
+-- left; slow slices in the warning color. The scale never shrinks below RTT_FLOOR_MS.
+local function barLayers()
+    local count = #rtt.samples
+    local per = math.ceil(count / RTT_BARS)
+    local bars = math.ceil(count / per)
+    local scale = math.max(RTT_FLOOR_MS, rtt.max)
+    local layers = table.create(bars)
+    for bar = 1, bars do
+        local first = (bar - 1) * per + 1
+        local peak = 0
+        for index = first, math.min(count, first + per - 1) do peak = math.max(peak, rtt.samples[index].ms) end
+        local color = peak >= RTT_SLOW_MS and "var(--warn)"
+            or (bar == bars and "var(--accent)" or "rgb(from var(--accent) r g b / 45%)")
+        layers[bar] = string.format("linear-gradient(%s, %s) %dpx 100%% / 6px %dpx no-repeat",
+            color, color, (RTT_BARS - bars + bar - 1) * 9, math.max(2, math.floor(peak / scale * 30 + 0.5)))
+    end
+    return table.concat(layers, ", ")
+end
+
+-- Tern's card has no hero, badge or chart for plugins; this sheet draws them over the
+-- rows. It relies on the card's markup, so a markup change degrades to plain rows.
+local function cardCss(marks, tone)
+    local function row(index) return CARD .. " .wgc-row:nth-child(" .. index .. ")" end
+    local hero = tone == "bad" and "var(--bad)" or (tone == "warn" and "var(--warn)" or "var(--t1)")
+    local badge = BADGE[tone] or { "var(--t2)", "var(--l1)" }
+    local label = hasConfig and ((cache.mode and string.upper(cache.mode) .. " · " or "") .. phaseLabel()) or "TURN"
+    local css = {
+        CARD .. " .wgc-v { max-width: 72%; overflow: hidden; text-overflow: ellipsis; }",
+        row(marks.hero) .. " { min-height: 32px; align-items: center; }",
+        row(marks.hero) .. " .wgc-k { font: 550 24px/28px var(--mono); letter-spacing: -0.03em; color: " .. hero .. "; }",
+        row(marks.hero) .. "::after { content: " .. quoted(label) .. "; flex: none; height: 20px; line-height: 20px;"
+            .. " padding: 0 8px; border-radius: 999px; font-size: 11.5px; color: " .. badge[1] .. "; background: " .. badge[2] .. "; }",
+    }
+    if marks.graph then
+        table.insert(css, row(marks.graph) .. " { height: 58px; align-items: flex-start; background: " .. barLayers() .. "; }")
+    end
+    if marks.problem then table.insert(css, row(marks.problem) .. " .wgc-v { color: var(--bad); }") end
+    if marks.action then table.insert(css, row(marks.action) .. " .wgc-v { color: var(--accent); }") end
+    if marks.foot then
+        table.insert(css, row(marks.foot) .. " { min-height: 18px; line-height: 18px; margin-top: 2px; }")
+        table.insert(css, row(marks.foot) .. " .wgc-k, " .. row(marks.foot) .. " .wgc-v { font-size: 11px; color: var(--t4); }")
+    end
+    return table.concat(css, "\n")
+end
+
+-- Card rows and their sheet come from the same state; the sheet is replaced only when it changed.
+paint = function()
+    if tern.chrome.widget then
+        local review = reviewing()
+        local _, action = clickAction(review)
+        local _, marks = cardRows(review, action)
+        local css = cardCss(marks, health())
+        if css ~= installedCss and pcall(tern.css, "card", css) then installedCss = css end
+    end
+    tern.chrome.refresh()
 end
 
 -- Chrome is pure: cache only, never process spawning, file reads or native Host calls.
@@ -1085,28 +1260,39 @@ end
 if tern.chrome.widget then
 tern.chrome.widget("turn", {
     name = "TURN Relay",
-    description = "TURN 状态与 Tern 实测往返延迟；悬停看详情，Tern 放弃连接后点击重连",
+    description = "Tern 实测往返延迟与 TURN 状态；悬停看详情，Tern 放弃连接后点击重连",
     icon = "broadcast",
     styles = { "graph", "text" },
     render = function()
-        local reviewing = onboarding and onboarding.reviewed ~= nil
-        local command, action = clickAction(reviewing)
+        local review = reviewing()
+        local command, action = clickAction(review)
+        local rows = cardRows(review, action)
         local series = nil
         if #rtt.samples > 0 then
+            local scale = math.max(RTT_FLOOR_MS, rtt.max)
             series = table.create(#rtt.samples)
-            for index, ms in ipairs(rtt.samples) do series[index] = math.min(ms / RTT_SCALE_MS, 1) end
+            for index, sample in ipairs(rtt.samples) do series[index] = math.min(sample.ms / scale, 1) end
         end
+        local tone = health()
         return {
-            text = reviewing and "TURN · 确认配置" or statusText,
-            tone = lastError and "error" or ((cache.gateway_recovering or cache.congested
-                or (cache.recovering_flows or 0) > 0 or nativeState == "stalled") and "warn" or "muted"),
-            title = tooltip(reviewing, action),
+            text = barText(review),
+            tone = tone == "bad" and "error" or (tone == "warn" and "warn" or "muted"),
+            title = table.concat(rows, "\n"),
             command = command,
             series = series,
         }
     end,
 })
 end
+
+-- Polling must survive hooks that were cut off: ordinary window events and a budget
+-- resume re-arm an overdue poll. History is saved before a reload replaces this VM.
+for _, event in ipairs({ "focus", "command_finished", "cwd", "title" }) do
+    tern.on(event, function() revive() end)
+end
+pcall(tern.on, "budget", function(ev) if type(ev) == "table" and ev.state == "resumed" then revive() end end)
+pcall(tern.on, "unload", function() if rtt.unsaved > 0 then saveRtt() end end)
+refresh()
 
 -- A plugin reload need not emit window_start, and headless timer clocks may be
 -- paused. One asynchronous status query supplies the fresh owner context on load.
