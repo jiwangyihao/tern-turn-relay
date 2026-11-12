@@ -2,7 +2,7 @@ local install = require('../window')
 local cases = {}
 
 local function fixture(os, configured, installed)
-    local f = { calls = {}, commands = {}, timers = {}, time = 0, mutations = 0, toasts = {}, details = '', hosts = {}, reads = {} }
+    local f = { calls = {}, commands = {}, timers = {}, time = 0, mutations = 0, toasts = {}, details = '', hosts = {}, reads = {}, kv = {} }
     f.config = { schema = 4, ssh_destination = 'server', listen_port = 18377,
         target = { name = 'server', host = '203.0.113.1', user = 'user', port = 22, fingerprint = 'original-pin' },
         gateway = { fingerprint = 'relay-pin', daemon_socket = '/private/daemon.sock' } }
@@ -45,6 +45,7 @@ local function fixture(os, configured, installed)
             return f.response
         end },
         process = { run = function(argv, options, callback) table.insert(f.calls, { argv = argv, options = options, callback = callback }) end },
+        kv = { get = function(key) return f.kv[key] end, set = function(key, value) f.kv[key] = value end },
         command = function(command) f.commands[command.id] = command end,
         chrome = { refresh = function()
             if f.interruptRefresh then
@@ -148,7 +149,7 @@ function cases.stop_bad_runtime_identity_and_timeout_preserve_hosts()
             f.time = 322001
             assert(f:tick())
         else
-            f:complete({ ok = true, runtime_ready = true, version = '0.5.13', binary = 'C:/wrong.exe' })
+            f:complete({ ok = true, runtime_ready = true, version = '0.5.14', binary = 'C:/wrong.exe' })
         end
         assert(#f.calls == 1 and f.mutations == 0 and f.status()[1].tone == 'error')
         f:command('status')
@@ -159,7 +160,7 @@ end
 function cases.successful_prepare_still_requires_real_stop_result()
     local f = fixture('windows', true)
     f:command('disconnect')
-    f:complete({ ok = true, runtime_ready = true, version = '0.5.13', binary = 'C:/用户/data/native-runtime/0.5.13/tern-turn-relay.exe' })
+    f:complete({ ok = true, runtime_ready = true, version = '0.5.14', binary = 'C:/用户/data/native-runtime/0.5.14/tern-turn-relay.exe' })
     assert(#f.calls == 2 and f.calls[2].argv[10] == '--exec' and f.calls[2].argv[11] == 'relay' and f.calls[2].argv[12] == 'stop')
     assert(f.mutations == 0)
     f:complete({ ok = true, state = 'stopped' }) -- 缺失状态 schema，不能伪报成功。
@@ -323,6 +324,50 @@ function cases.aborted_status_delivery_expires_without_reload_or_user_command()
     f:complete(f:value('ready'))
     assert(f.status()[1].text:find('已连接') and not f.status()[1].text:find('恢复中'))
     assert(f.mutations == 0, '恢复观察不能修改 Host 或重启后台')
+end
+
+function cases.clean_restore_revokes_auto_recovery_only_after_alias_detaches()
+    for _, detachFails in ipairs({ false, true }) do
+        local f = fixture('macos', true, true)
+        local alias = { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', detail = { fingerprint = 'relay-pin' } }
+        f.hosts = { alias }
+        local current = alias
+        local base = f.context
+        function f:context()
+            local cx = base(self)
+            cx.hosts = {
+                list = function() return self.hosts end,
+                current = function() return current end,
+                add = function(_, address)
+                    local host = { kind = 'remote', id = 'direct', address = address, state = 'connected', detail = { fingerprint = 'original-pin' } }
+                    table.insert(self.hosts, host)
+                    return { next = function(_, callback) callback(host, nil, cx) end }
+                end,
+                switch = function(_, id) for _, host in ipairs(self.hosts) do if host.id == id then current = host end end end,
+                disconnect = function(_, id)
+                    if detachFails then error('rejected') end
+                    for index, host in ipairs(self.hosts) do if host.id == id then table.remove(self.hosts, index); break end end
+                end,
+                trust = function() error('restore must not trust') end,
+            }
+            return cx
+        end
+        f:complete(f:value('ready', 'tls'))
+        local before = #f.calls
+        f:command('restore-direct')
+        assert(current.id == 'direct', 'restore must switch to the original direct Host')
+        local released = false
+        for index = before + 1, #f.calls do
+            if f.calls[index].argv[6] == 'release' then released = true end
+        end
+        if detachFails then
+            assert(not released, 'alias still attached: TURN stays the selected route')
+        else
+            assert(released and f.calls[#f.calls].argv[6] == 'release', 'clean restore must revoke auto-recovery')
+            f:complete(f:value('ready'))
+            assert(f.status()[1].tone ~= 'error')
+        end
+    end
 end
 
 return { run = function()

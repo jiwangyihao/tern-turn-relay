@@ -482,6 +482,17 @@ schedule = function()
     end)
 end
 
+-- A clean restore means the TURN alias is no longer the selected route. Revoke
+-- automatic recovery so the shared relay exits once idle instead of holding its
+-- listener; live flows and SSH TCP sessions keep running until then.
+local function releaseRoute(token, cx)
+    helper("release", nil, token, cx, function(value, err, fresh)
+        if value then accept(value) end
+        if err then report(fresh, "Original Host restored, but TURN auto-recovery was not revoked: " .. err) end
+        refresh()
+    end)
+end
+
 stepNative = function(cx, request)
     if pending ~= request then return end
     if not cx then failNative(nil, "Native reconciliation has no fresh window context."); return end
@@ -652,6 +663,7 @@ stepNative = function(cx, request)
                 request.action == "convert"
                     and "Dedicated identity verified and gateway traffic observed. There is no automatic direct fallback. Remote session programs keep running."
                     or "Shared relay and SSH TCP sessions were not stopped; remote programs keep running.")
+            if request.action == "restore" then releaseRoute(request.token, cx) end
         end
         schedule()
     end

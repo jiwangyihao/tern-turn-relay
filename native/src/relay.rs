@@ -49,7 +49,15 @@ const FLOW_IDLE: Duration = Duration::from_secs(180);
 const SERVICE_IDLE: Duration = Duration::from_secs(120);
 
 fn invalid() -> Error {
-    Error::new("invalid_arguments", "Use relay start|resume|status|stop --config PATH --state-dir PATH; start requires --mode tls|udp.")
+    Error::new("invalid_arguments", "Use relay start|resume|release|status|stop --config PATH --state-dir PATH; start requires --mode tls|udp.")
+}
+
+/// A saved resume selection for this exact configuration and mode keeps an idle relay
+/// listening. Tern makes one connection attempt per trigger and does not retry, so a
+/// relay that exits while selected strands every later reconnect until a window
+/// restart resumes it. Stop and release revoke the selection; then idleness ends it.
+fn holds_route(config: &Value, directory: &Path, mode: Mode) -> bool {
+    intent::load(config, directory).ok().flatten().as_deref() == Some(mode.name())
 }
 fn runtime_error() -> Error {
     Error::new(
@@ -1624,6 +1632,7 @@ async fn serve(
                 _ = tick.tick() => {
                     let mut removed = Vec::new();
                     let should_renew;
+                    let idle;
                     {
                         let mut state = shared.state.lock().unwrap();
                         let now = Instant::now();
@@ -1635,13 +1644,22 @@ async fn serve(
                         for address in finished { if let Some(flow) = state.flows.remove(&address) { removed.push(flow); } }
                         if !removed.is_empty() && state.flows.is_empty() && state.ssh_count.load(Ordering::SeqCst) == 0 { state.no_clients_since = now; }
                         if state.ssh_count.load(Ordering::SeqCst) != 0 { state.no_clients_since = now; }
-                        if (state.initialized || shared.fatal.is_cancelled()) && state.flows.is_empty()
+                        idle = (state.initialized || shared.fatal.is_cancelled()) && state.flows.is_empty()
                             && state.ssh_count.load(Ordering::SeqCst) == 0 && !state.gateway_recovering
-                            && now.duration_since(state.no_clients_since) >= SERVICE_IDLE { shared.stop.cancel(); }
+                            && now.duration_since(state.no_clients_since) >= SERVICE_IDLE;
                         should_renew = !shared.fatal.is_cancelled() && state.route_available
                             && (state.credentials_expires.is_some_and(|expires| common::unix_time() >= expires - 300.0)
                                 || state.warm.as_ref().is_some_and(|warm| !warm.usable() || warm.expires <= common::unix_time() + 300.0))
                             && renewal.as_ref().is_none_or(JoinHandle::is_finished);
+                    }
+                    if idle {
+                        // Read the selection outside the state lock. A held route restarts the
+                        // idle clock, so the file is checked once per SERVICE_IDLE, not per tick.
+                        if !shared.fatal.is_cancelled() && holds_route(&shared.config, &directory, shared.mode) {
+                            shared.state.lock().unwrap().no_clients_since = Instant::now();
+                        } else {
+                            shared.stop.cancel();
+                        }
                     }
                     for flow in removed { let _ = flow.task.await; }
                     check_warm(&shared).await;
@@ -1732,7 +1750,7 @@ pub async fn run(args: &[String]) -> Result<Value> {
         return Err(invalid());
     }
     let command = options.positionals[0].as_str();
-    if !matches!(command, "start" | "resume" | "status" | "stop" | "serve") {
+    if !matches!(command, "start" | "resume" | "release" | "status" | "stop" | "serve") {
         return Err(invalid());
     }
     let config_path = PathBuf::from(options.required("--config")?);
@@ -1742,7 +1760,7 @@ pub async fn run(args: &[String]) -> Result<Value> {
     common::private_dir(&directory, true)?;
     let config = match common::load_config(&config_path, false) {
         Ok(config) => Some(config),
-        Err(_) if matches!(command, "status" | "stop") => None,
+        Err(_) if matches!(command, "status" | "stop" | "release") => None,
         Err(error) => return Err(error),
     };
     if command != "serve"
@@ -1781,6 +1799,12 @@ pub async fn run(args: &[String]) -> Result<Value> {
         })?;
         if command == "stop" {
             return stop(config.as_ref(), &directory).await;
+        }
+        if command == "release" {
+            // Revoke automatic recovery only: live flows and SSH TCP keep running, and the
+            // service exits on its own once idle.
+            intent::clear(&directory)?;
+            return current_status(config.as_ref(), &directory).await;
         }
         let config = config.as_ref().ok_or_else(invalid)?;
         if command == "resume" {
@@ -2910,6 +2934,42 @@ mod tests {
         assert!(directory.join("status.json").exists());
         fs::remove_file(directory.join("status.json")).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    fn route_config() -> Value {
+        json!({"target":{"host":"1.1.1.1","user":"alice","port":1234},
+            "gateway":{"fingerprint":"pinned","daemon_socket":"/run/user/123/daemon.sock"},
+            "listen_port":18377,"ssh_destination":"server"})
+    }
+
+    #[test]
+    fn idle_relay_stays_only_while_its_exact_route_is_selected() {
+        let directory = private_test_directory("ttr-route");
+        let config = route_config();
+        assert!(!holds_route(&config, &directory, Mode::Udp), "no selection: idle relay exits");
+        intent::save(&config, &directory, "udp").unwrap();
+        assert!(holds_route(&config, &directory, Mode::Udp));
+        assert!(!holds_route(&config, &directory, Mode::Tls), "a selection for another mode is not this relay's route");
+        let mut moved = config.clone();
+        moved["listen_port"] = json!(18378);
+        assert!(!holds_route(&moved, &directory, Mode::Udp), "a selection for another target is not this relay's route");
+        intent::clear(&directory).unwrap();
+        assert!(!holds_route(&config, &directory, Mode::Udp));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_revokes_selection_without_config_or_starting_a_service() {
+        let directory = private_test_directory("ttr-release");
+        intent::save(&route_config(), &directory, "udp").unwrap();
+        let args: Vec<String> = ["release", "--config", directory.join("missing.json").to_str().unwrap(),
+            "--state-dir", directory.to_str().unwrap()].map(String::from).into();
+        let result = run(&args).await.unwrap();
+        assert_eq!(result["state"], "stopped");
+        assert_eq!(result["resume_mode"], Value::Null);
+        assert!(intent::load(&route_config(), &directory).unwrap().is_none());
+        assert!(!directory.join("pid.json").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
