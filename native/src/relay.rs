@@ -837,6 +837,41 @@ where
     Ok(())
 }
 
+// A new connection takes the warm allocation for itself. Prepare its successor at once:
+// otherwise the next connection (a reconnect, another window) allocates on demand, and
+// on a lossy path that outlasts a client's handshake wait, so the reconnect itself fails.
+async fn replenish_warm<Open, Opening>(shared: &Shared, open: &mut Open) -> Result<()>
+where
+    Open: FnMut(TurnConfig, SocketAddr, bool) -> Opening,
+    Opening: Future<Output = std::result::Result<Arc<Endpoint>, TransportError>>,
+{
+    let (peer, generation) = {
+        let state = shared.state.lock().unwrap();
+        let Some(peer) = state.peer.filter(|_| state.warm.is_none()) else { return Ok(()); };
+        (peer, state.generation.clone())
+    };
+    let next = tokio::select! {
+        biased;
+        _ = shared.stop.cancelled() => return Ok(()),
+        _ = shared.fatal.cancelled() => return Ok(()),
+        _ = generation.cancelled() => return Ok(()),
+        result = prepare_endpoint(shared, peer, None, open) => result?,
+    };
+    let installed = {
+        let mut state = shared.state.lock().unwrap();
+        if !generation.is_cancelled() && !shared.stop.is_cancelled() && !shared.fatal.is_cancelled()
+            && state.route_available && state.warm.is_none() {
+            state.warm = Some(next.clone());
+            state.recovery_error = None;
+            true
+        } else { false }
+    };
+    if !installed {
+        next.close().await;
+    }
+    Ok(())
+}
+
 async fn warm_gateway(
     shared: Arc<Shared>,
     peer: SocketAddr,
@@ -1633,6 +1668,7 @@ async fn serve(
                     let mut removed = Vec::new();
                     let should_renew;
                     let idle;
+                    let replenish;
                     {
                         let mut state = shared.state.lock().unwrap();
                         let now = Instant::now();
@@ -1651,6 +1687,9 @@ async fn serve(
                             && (state.credentials_expires.is_some_and(|expires| common::unix_time() >= expires - 300.0)
                                 || state.warm.as_ref().is_some_and(|warm| !warm.usable() || warm.expires <= common::unix_time() + 300.0))
                             && renewal.as_ref().is_none_or(JoinHandle::is_finished);
+                        replenish = !shared.fatal.is_cancelled() && state.route_available && state.initialized
+                            && state.warm.is_none() && state.peer.is_some()
+                            && renewal.as_ref().is_none_or(JoinHandle::is_finished);
                     }
                     if idle {
                         // Read the selection outside the state lock. A held route restarts the
@@ -1663,7 +1702,7 @@ async fn serve(
                     }
                     for flow in removed { let _ = flow.task.await; }
                     check_warm(&shared).await;
-                    if should_renew {
+                    if should_renew || replenish {
                         let renew_shared = shared.clone();
                         renewal = Some(tokio::spawn(async move {
                             let generation = renew_shared.state.lock().unwrap().generation.clone();
@@ -1673,6 +1712,9 @@ async fn serve(
                                 _ = renew_shared.fatal.cancelled() => Ok(()),
                                 _ = generation.cancelled() => Ok(()),
                                 result = async {
+                                    if replenish {
+                                        return replenish_warm(&renew_shared, &mut allocate).await;
+                                    }
                                     renew_shared.turn_config(true).await?;
                                     rotate_warm(&renew_shared, &mut allocate).await
                                 } => result,
@@ -2216,6 +2258,51 @@ mod tests {
         assert!(shared.state.lock().unwrap().warm.is_none());
         assert!(!shared.state.lock().unwrap().route_available);
         assert!(!shared.fatal.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn claimed_warm_is_replenished_unless_a_spare_appears_meanwhile() {
+        for spare_appears in [false, true] {
+            let mut next = transport::gated_endpoint(Duration::from_secs(120));
+            let other = transport::gated_endpoint(Duration::from_secs(120));
+            let shared = Arc::new(recovery_shared());
+            seed_credentials(&shared, next.endpoint.expires).await;
+            shared.state.lock().unwrap().peer = Some("127.0.0.1:4321".parse().unwrap());
+            let (started, mut opening) = mpsc::channel(1);
+            let gate = Arc::new(Notify::new());
+            let release = gate.clone();
+            let replacement = next.endpoint.clone();
+            let task_shared = shared.clone();
+            let replenishing = tokio::spawn(async move {
+                let mut open = move |_, _, _| {
+                    let started = started.clone();
+                    let gate = gate.clone();
+                    let endpoint = replacement.clone();
+                    async move {
+                        started.send(()).await.unwrap();
+                        gate.notified().await;
+                        Ok(endpoint)
+                    }
+                };
+                replenish_warm(&task_shared, &mut open).await
+            });
+            timeout(Duration::from_secs(2), opening.recv()).await.unwrap().unwrap();
+            if spare_appears {
+                shared.state.lock().unwrap().warm = Some(other.endpoint.clone());
+            }
+            release.notify_one();
+            timeout(Duration::from_secs(2), replenishing).await.unwrap().unwrap().unwrap();
+            let warm = shared.state.lock().unwrap().warm.clone().unwrap();
+            if spare_appears {
+                assert!(Arc::ptr_eq(&warm, &other.endpoint), "a spare that appeared meanwhile is kept");
+                timeout(Duration::from_secs(2), next.incoming.closed()).await.unwrap();
+            } else {
+                assert!(Arc::ptr_eq(&warm, &next.endpoint), "the claimed spare is replaced");
+                assert!(next.endpoint.usable());
+            }
+            retire_route(&shared).await;
+            assert!(!shared.fatal.is_cancelled());
+        }
     }
 
     #[tokio::test]

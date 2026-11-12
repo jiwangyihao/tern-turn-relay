@@ -46,6 +46,19 @@ local disconnect
 local runner
 local failNative
 local stepNative
+local watchSession
+local reconnect
+-- Tern's session to the configured entry is re-attached automatically when it is lost:
+-- stalled, given up, or connected yet silent. A healthy session never goes 4 s without
+-- downstream bytes (p99 of a day's samples), so 30 s of silence means a dead session.
+local STALL_RECONNECT_MS = 20000
+local FAILED_RECONNECT_MS = 5000
+local SILENT_RECONNECT_MS = 30000
+local RECONNECT_RETRY_MS = 30000
+local RECONNECT_RETRY_MAX_MS = 300000
+local auto = { reason = nil, since = nil, nextAt = 0, delay = RECONNECT_RETRY_MS }
+-- A round trip of seconds is a stalled link's estimate (55 s after a wake), not a path.
+local RTT_MAX_SAMPLE_MS = 10000
 local helperRequests = {}
 local onboarding
 local setupError
@@ -108,6 +121,9 @@ local function rateStats()
 end
 
 rtt.samples = loadSamples(RTT_KV, { "ms" })
+for index = #rtt.samples, 1, -1 do
+    if rtt.samples[index].ms >= RTT_MAX_SAMPLE_MS then table.remove(rtt.samples, index) end
+end
 rttStats()
 rate.samples = loadSamples(RATE_KV, { "up", "down" })
 rateStats()
@@ -216,7 +232,7 @@ local function recordRtt(host)
     if rtt.at and now - rtt.at < POLL_MS / 2 then return end
     rtt.at = now
     local ms = host and host.state == "connected" and host.rtt_ms
-    if type(ms) ~= "number" or ms < 0 or ms >= math.huge then rtt.last = nil; return end
+    if type(ms) ~= "number" or ms < 0 or ms >= RTT_MAX_SAMPLE_MS then rtt.last = nil; return end
     rtt.last = ms
     local wall = os.time()
     table.insert(rtt.samples, { t = wall, ms = ms })
@@ -229,7 +245,10 @@ end
 -- Throughput from the relay's cumulative byte counters between two status answers of
 -- the same service; a restart or a counter that went back starts a new baseline.
 local function recordRate(value)
-    if value.state ~= "ready" then rate.prev = nil; rate.up = nil; rate.down = nil; return end
+    if value.state ~= "ready" and value.state ~= "starting" then
+        rate.prev = nil; rate.up = nil; rate.down = nil; rate.lastDownAt = nil
+        return
+    end
     local now = tern.now()
     local previous = rate.prev
     if previous and previous.service == value.service_id and now - previous.at < 1000 then return end
@@ -238,8 +257,10 @@ local function recordRate(value)
     local down = previous and value.bytes_down - previous.down
     if not previous or previous.service ~= value.service_id or up < 0 or down < 0 then
         rate.up = nil; rate.down = nil
+        rate.lastDownAt = now
         return
     end
+    if down > 0 then rate.lastDownAt = now end
     local seconds = (now - previous.at) / 1000
     rate.up, rate.down = up / seconds, down / seconds
     local wall = os.time()
@@ -350,8 +371,9 @@ local function helper(command, mode, token, _cx, callback)
         end
         local value, err = decode(result.stdout)
         if not value then callback(nil, err, fresh); return end
-        if command == "status" and value.state == "starting"
-            and (value.gateway_recovering or (value.recovering_flows or 0) > 0 or value.recovery_error ~= nil) then
+        -- A running relay between allocations, or recovering its gateway, reports
+        -- `starting` without ok: that is live status, not a failed command.
+        if command == "status" and value.state == "starting" and value.error == nil then
             callback(value, nil, fresh)
             return
         end
@@ -585,6 +607,7 @@ schedule = function()
                 end
                 inspectNative(current)
                 refresh()
+                if watchSession then watchSession(current) end
                 schedule()
             end, "poll")
         end)
@@ -631,7 +654,7 @@ stepNative = function(cx, request)
         failNative(cx, "Native operation timed out in " .. phase .. "; connectivity was not confirmed.")
         return
     end
-    if request.action == "convert" and (cache.state ~= "ready"
+    if request.action ~= "restore" and ((cache.state ~= "ready" and not (request.action == "reconnect" and cache.state == "starting"))
         or cache.service_id ~= request.service_id or not sameTarget(cache, request.config)) then
         failNative(cx, "Relay readiness or identity changed during reconnect.")
         return
@@ -692,7 +715,7 @@ stepNative = function(cx, request)
         nativeState = host and host.state or "connecting"
         if host and host.state == "connected" then
             request.connectedId = host.id
-            queueNative(request, request.action == "convert" and "traffic" or "switch")
+            queueNative(request, request.action == "convert" and "traffic" or (request.switchBack and "switch" or "finish"))
         elseif host and host.state == "verify" then
             if fingerprint ~= request.fingerprint then
                 failNative(cx, "Native fingerprint is missing or mismatched. Trust refused.")
@@ -774,10 +797,15 @@ stepNative = function(cx, request)
     elseif phase == "finish" then
         pending = nil
         busy = nil
-        nativeState = request.action == "convert" and "connected" or "disconnected"
+        nativeState = request.action == "restore" and "disconnected" or "connected"
         lastError = nil
         if request.notice then
             report(cx, request.notice)
+        elseif request.action == "reconnect" then
+            refresh()
+            cx:toast("info", "TURN 已重新连接", request.automatic
+                and "Tern 的会话失效后已自动重连同一入口；远端程序继续运行。"
+                or "已重新连接同一入口；远端程序继续运行。")
         else
             refresh()
             cx:toast(request.action == "convert" and "info" or "success",
@@ -794,21 +822,25 @@ end
 local function attach(action, config, original, source, token, cx)
     if not cx then report(nil, "No fresh window context; no Host action was taken."); return end
     if not stillSelected(cx, source) then report(cx, "Selected Host changed; no Host was detached or switched."); return end
-    local address = action == "convert" and config.address or original
+    local address = action == "restore" and original or config.address
     local found, existing = pcall(exactHost, cx, address)
     if not found then report(cx, "Cannot inspect destination Host; no Host was changed."); return end
-    local oldAddress = action == "convert" and original or config.address
-    local inspected, old = pcall(exactHost, cx, oldAddress)
+    -- Convert retires the original direct Host and restore the TURN entry; a reconnect
+    -- replaces only the same entry.
+    local oldAddress = action == "convert" and original or (action == "restore" and config.address or nil)
+    local inspected, old = true, nil
+    if oldAddress then inspected, old = pcall(exactHost, cx, oldAddress) end
     if not inspected then report(cx, "Cannot inspect the original Host; no Host was changed."); return end
     local request = { action = action, config = config, source = source, address = address, token = token,
-        original = original, fingerprint = action == "convert" and config.relayFingerprint or config.target.fingerprint,
+        original = original, fingerprint = action == "restore" and config.target.fingerprint or config.relayFingerprint,
         service_id = cache.service_id,
         deadline = tern.now() + CONNECT_MS, trustRequested = false, cleanupHost = old,
+        switchBack = action ~= "reconnect" or (existing ~= nil and source.id == existing.id),
         reconnectId = existing and existing.id, bytesUpBefore = cache.bytes_up, bytesDownBefore = cache.bytes_down }
     pending = request
     nativeState = "connecting"
-    -- Manual conversion of an exact existing alias always disconnects/re-adds it.
-    queueNative(request, action == "convert" and existing and "detach" or "add")
+    -- An exact existing TURN entry is always disconnected and re-added, never reused.
+    queueNative(request, action ~= "restore" and existing and "detach" or "add")
     refresh()
     schedule()
 end
@@ -958,6 +990,21 @@ local function restore(cx)
     if not request then return end
     -- No helper stop: this backend may still serve SSH TCP or other windows.
     attach("restore", request.config, request.original, request.source, request.token, cx)
+end
+
+-- Re-attach the same configured TURN entry after Tern lost its session: same address,
+-- same pinned identity, no direct fallback. The window returns to it only if it was
+-- showing it, so an automatic reconnect never moves the user's view.
+reconnect = function(cx, automatic)
+    local request = prepare(cx, true)
+    if not request then return end
+    local ok, existing = pcall(exactHost, cx, request.config.address)
+    if not ok or not existing then
+        report(cx, "The configured TURN entry is not attached; use Connect configured Host via TURN to add it.")
+        return
+    end
+    attach("reconnect", request.config, request.original, request.source, request.token, cx)
+    if pending then pending.automatic = automatic end
 end
 
 local DETAILS_TITLE = "TURN 连接详情"
@@ -1147,12 +1194,16 @@ tern.command({ id = "convert-udp", title = "Connect configured Host via TURN UDP
 tern.command({ id = "restore-direct", title = "Restore configured Host to direct (keep relay and SSH)", group = "TURN", run = commandTick(restore) })
 tern.command({ id = "disconnect", title = "Stop TURN for ALL windows and SSH TCP sessions (interrupts TCP)", group = "TURN", run = commandTick(disconnect) })
 tern.command({ id = "status", title = "Status: TURN mode, native Host, SSH TCP, bytes and errors", group = "TURN", run = commandTick(status) })
+tern.command({ id = "reconnect", title = "Reconnect configured Host via TURN (same entry)", group = "TURN",
+    run = commandTick(function(cx) reconnect(cx, false) end) })
 
--- Clicking reconnects only a Host Tern has given up on; it never interrupts a live,
--- stalled or reconnecting one, and never runs while another operation is pending.
+-- Clicking re-attaches the entry Tern lost (stalled or given up), adds it when it is
+-- missing, and never interrupts a live, connecting or reconnecting one.
 local function clickAction(review)
     if review or not hasConfig or not helperReady then return "plugin.tern-turn-relay.setup", "打开 TURN 设置" end
-    if busy or pending or (nativeState ~= "disconnected" and nativeState ~= "failed") then return nil, nil end
+    if busy or pending then return nil, nil end
+    if nativeState == "stalled" or nativeState == "failed" then return "plugin.tern-turn-relay.reconnect", "重新连接" end
+    if nativeState ~= "disconnected" then return nil, nil end
     local mode = cache.mode or cache.resume_mode or "udp"
     return "plugin.tern-turn-relay.convert-" .. mode, "经 TURN " .. string.upper(mode) .. " 连接"
 end
@@ -1242,6 +1293,33 @@ local function health()
     return nil
 end
 
+-- The same configured entry on a healthy relay: when Tern's session is lost (stalled,
+-- given up, or connected yet silent) re-attach it, at a growing interval while it keeps
+-- failing. An entry the user removed from Tern, or a stopped relay, is left alone.
+watchSession = function(cx)
+    if not cx or not hasConfig or not helperReady or busy or pending or reviewing() then return end
+    if onboarding and onboarding.active then return end
+    local ok, host = pcall(exactHost, cx, alias)
+    if not ok or not host then auto.reason = nil; auto.since = nil; return end
+    local now = tern.now()
+    local silent = (host.state == "connected" or host.state == "stalled") and (cache.flows or 0) >= 1
+        and rate.lastDownAt ~= nil and now - rate.lastDownAt >= SILENT_RECONNECT_MS
+    local reason = (silent and "silent") or (host.state == "stalled" and "stalled")
+        or (host.state == "failed" and "failed") or nil
+    if not reason then
+        auto.reason = nil; auto.since = nil
+        if host.state == "connected" then auto.delay = RECONNECT_RETRY_MS end
+        return
+    end
+    if auto.reason ~= reason then auto.reason = reason; auto.since = now end
+    local grace = reason == "stalled" and STALL_RECONNECT_MS or (reason == "failed" and FAILED_RECONNECT_MS or 0)
+    if now - auto.since < grace or now < auto.nextAt then return end
+    if (cache.state ~= "ready" and cache.state ~= "starting") or cache.gateway_recovering then return end
+    auto.nextAt = now + auto.delay
+    auto.delay = math.min(auto.delay * 2, RECONNECT_RETRY_MAX_MS)
+    reconnect(cx, true)
+end
+
 local function span(seconds)
     if seconds < 90 then return string.format("近 %d 秒", math.max(1, seconds)) end
     return string.format("近 %d 分钟", math.floor(seconds / 60 + 0.5))
@@ -1324,22 +1402,42 @@ local function chartSvg(area, dashed)
         CHART_W, CHART_H, CHART_H, area, CHART_W, CHART_H, dashed, area)
 end
 
+-- Every refresh repaints the card, several times per poll during a reconnect; a chart's
+-- points only change with its samples, so its SVG is rebuilt once per new sample. Under
+-- memory pressure the rebuilds alone ran a timer hook past its 50 ms Lua budget.
+local chartCache = {}
+local function cachedChart(name, key, build)
+    local entry = chartCache[name]
+    if not entry or entry.key ~= key then
+        local svg, label = build()
+        entry = { key = key, svg = svg, label = label }
+        chartCache[name] = entry
+    end
+    return entry.svg, entry.label
+end
+
 -- Latency oldest left, the median dashed.
 local function rttChart()
-    local values = table.create(#rtt.samples)
-    for index, sample in ipairs(rtt.samples) do values[index] = sample.ms end
-    local scale, label = rttScale()
-    local line, y = points(values, scale)
-    local median = y(rtt.median)
-    return chartSvg(line, string.format("0,%.1f %d,%.1f", median, CHART_W, median)), label
+    local first, last = rtt.samples[1], rtt.samples[#rtt.samples]
+    return cachedChart("rtt", string.format("%d:%d:%d:%g", #rtt.samples, first.t, last.t, last.ms), function()
+        local values = table.create(#rtt.samples)
+        for index, sample in ipairs(rtt.samples) do values[index] = sample.ms end
+        local scale, label = rttScale()
+        local line, y = points(values, scale)
+        local median = y(rtt.median)
+        return chartSvg(line, string.format("0,%.1f %d,%.1f", median, CHART_W, median)), label
+    end)
 end
 
 -- Download as the area, upload dashed, on one scale.
 local function rateChart()
-    local down, up = table.create(#rate.samples), table.create(#rate.samples)
-    for index, sample in ipairs(rate.samples) do down[index] = sample.down; up[index] = sample.up end
-    local scale, label = rateScale(math.max(rate.peakDown, rate.peakUp))
-    return chartSvg((points(down, scale)), (points(up, scale))), label
+    local first, last = rate.samples[1], rate.samples[#rate.samples]
+    return cachedChart("rate", string.format("%d:%d:%d:%g:%g", #rate.samples, first.t, last.t, last.down, last.up), function()
+        local down, up = table.create(#rate.samples), table.create(#rate.samples)
+        for index, sample in ipairs(rate.samples) do down[index] = sample.down; up[index] = sample.up end
+        local scale, label = rateScale(math.max(rate.peakDown, rate.peakUp))
+        return chartSvg((points(down, scale)), (points(up, scale))), label
+    end)
 end
 
 -- Tern's card has no hero, pill, chart or sections for plugins; this sheet draws them

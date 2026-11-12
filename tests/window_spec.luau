@@ -390,12 +390,12 @@ function cases.widget_graphs_tern_rtt_and_reconnects_only_a_host_tern_gave_up()
     assert(view.text == '450 ms', 'a connected bar shows only its latency')
     assert(view.title:find('中位 450 · 峰值 1500 ms', 1, true))
     assert(view.command == nil, 'a connected Host is never reconnected by a click')
-    for _, state in ipairs({ 'stalled', 'reconnecting' }) do
-        host.state = state; host.rtt_ms = nil
+    for _, case in ipairs({ { 'stalled', 'plugin.tern-turn-relay.reconnect' }, { 'reconnecting', nil } }) do
+        host.state = case[1]; host.rtt_ms = nil
         f.time += 3000; f:flush()
         f:complete(f:value('ready', 'tls'))
-        assert(f:view().command == nil, state .. ' must not be interrupted')
-        assert(not f:view().text:find(' ms', 1, true), 'no stale RTT while ' .. state)
+        assert(f:view().command == case[2], case[1] .. ': a lost entry re-attaches on click, Tern\'s own reconnect is left alone')
+        assert(not f:view().text:find(' ms', 1, true), 'no stale RTT while ' .. case[1])
     end
     host.state = 'stalled'
     f.time += 3000; f:flush()
@@ -404,8 +404,12 @@ function cases.widget_graphs_tern_rtt_and_reconnects_only_a_host_tern_gave_up()
     host.state = 'failed'
     f.time += 3000; f:flush()
     f:complete(f:value('ready', 'tls'))
-    assert(f:view().command == 'plugin.tern-turn-relay.convert-tls', 'a Host Tern gave up on reconnects in its saved mode')
-    assert(f.mutations == 0)
+    assert(f:view().command == 'plugin.tern-turn-relay.reconnect', 'an entry Tern gave up on is re-attached')
+    f.hosts = {}
+    f.time += 3000; f:flush()
+    f:complete(f:value('ready', 'tls'))
+    assert(f:view().command == 'plugin.tern-turn-relay.convert-tls', 'a missing entry is added in the saved mode')
+    assert(f.mutations == 0, 'nothing reconnects automatically within the grace periods')
 end
 
 function cases.card_sheet_styles_the_rows_it_describes()
@@ -489,6 +493,126 @@ function cases.throughput_is_counter_delta_and_restarts_after_a_reset()
     assert(f.widgets.rate.render(nil).text == '↓512K ↑0B')
     assert(f:view().title:find('峰值 ↓1.0 MiB/s · ↑1.0 KiB/s', 1, true), 'the peak spans the whole history')
     assert(f.sheets.card:find('content: "1 MiB/s"', 1, true), 'the throughput chart tops at the rounded-up peak')
+end
+
+-- A working cx.hosts: disconnect removes, add appends (connected unless log.addState
+-- says otherwise), switch moves the window. `current` is what the window shows.
+local function liveHosts(f, current)
+    local log = { disconnects = 0, adds = 0, switches = 0, addTimes = {} }
+    local base = f.context
+    function f:context()
+        local cx = base(self)
+        cx.hosts = {
+            list = function() return self.hosts end,
+            current = function() return current end,
+            add = function(_, address)
+                log.adds += 1
+                table.insert(log.addTimes, self.time)
+                local host = { kind = 'remote', id = 'relay-' .. log.adds, address = address,
+                    state = log.addState or 'connected', detail = { fingerprint = 'relay-pin' } }
+                table.insert(self.hosts, host)
+                return { next = function(_, callback)
+                    if host.state == 'connected' then callback(host, nil, cx) else callback(nil, 'failed', cx) end
+                end }
+            end,
+            switch = function(_, id)
+                log.switches += 1
+                for _, host in ipairs(self.hosts) do if host.id == id then current = host end end
+            end,
+            disconnect = function(_, id)
+                log.disconnects += 1
+                for index, host in ipairs(self.hosts) do if host.id == id then table.remove(self.hosts, index); break end end
+            end,
+            trust = function() error('a pinned entry is never re-trusted') end,
+        }
+        return cx
+    end
+    return log
+end
+
+local function aliasHost(state)
+    return { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = state, detail = { fingerprint = 'relay-pin' } }
+end
+
+-- One poll interval: answer the status query only when the plugin actually made one (a
+-- reconnect retires the generation, so the next timer re-arms without querying).
+local function poll(f, value)
+    local before = #f.calls
+    f.time += 3000; f:flush()
+    if #f.calls > before then f:complete(value or f:value('ready', 'tls')) end
+    f:flush()
+end
+
+function cases.stalled_entry_is_reattached_in_the_background_after_a_grace_period()
+    local f = fixture('macos', true, true)
+    local alias = aliasHost('connected')
+    f.hosts = { alias }
+    local log = liveHosts(f, { kind = 'local', id = 'local' })
+    f:complete(f:value('ready', 'tls'))
+    alias.state = 'stalled'
+    poll(f)
+    local stalledAt = f.time
+    while f.time - stalledAt < 18000 do poll(f) end
+    assert(log.disconnects == 0 and log.adds == 0, 'a stall shorter than 20 s is left to Tern')
+    while log.adds == 0 and f.time - stalledAt < 30000 do poll(f) end
+    assert(f.time - stalledAt >= 20000 and log.disconnects == 1 and log.adds == 1,
+        'after 20 s the stalled entry is detached and the same address re-added')
+    assert(log.switches == 0, 'a window showing another Host is not moved')
+    assert(#f.hosts == 1 and f.hosts[1].address == 'user@127.0.0.1:18377' and f.hosts[1].state == 'connected')
+    assert(f:view().text ~= '卡住')
+end
+
+function cases.connected_but_silent_session_is_reattached_and_its_window_follows()
+    local f = fixture('macos', true, true)
+    local alias = aliasHost('connected')
+    f.hosts = { alias }
+    local log = liveHosts(f, alias)
+    local function silent()
+        local value = f:value('ready', 'tls')
+        value.flows, value.bytes_down = 1, 4096
+        return value
+    end
+    f:complete(silent())
+    while f.time < 27000 do poll(f, silent()) end
+    assert(log.adds == 0, 'under 30 s of silence nothing happens')
+    while log.adds == 0 and f.time < 40000 do poll(f, silent()) end
+    assert(f.time >= 30000 and log.disconnects == 1 and log.adds == 1, '30 s without a downstream byte is a dead session')
+    assert(log.switches == 1, 'the window that showed the entry shows it again')
+end
+
+function cases.removed_entry_is_left_alone_and_failing_reconnects_back_off()
+    local f = fixture('macos', true, true)
+    local log = liveHosts(f, { kind = 'local', id = 'local' })
+    f:complete(f:value('ready', 'tls'))
+    for _ = 1, 20 do poll(f) end
+    assert(log.disconnects == 0 and log.adds == 0, 'an entry the user removed is never re-added')
+    local g = fixture('macos', true, true)
+    g.hosts = { aliasHost('failed') }
+    local failing = liveHosts(g, { kind = 'local', id = 'local' })
+    failing.addState = 'failed'
+    g:complete(g:value('ready', 'tls'))
+    while #failing.addTimes < 3 and g.time < 200000 do poll(g) end
+    local at = failing.addTimes
+    assert(#at == 3, 'retries keep going while the entry stays lost')
+    assert(at[1] >= 5000 and at[2] - at[1] >= 30000 and at[2] - at[1] < 36000
+        and at[3] - at[2] >= 60000 and at[3] - at[2] < 66000, 'retries wait 30 s, then 60 s: ' .. table.concat(at, ','))
+end
+
+function cases.multi_second_round_trips_are_stall_artifacts_not_samples()
+    local now = os.time()
+    local f = fixture('macos', true, true, { ['rtt-history'] = { { t = now - 20, ms = 55102 }, { t = now - 10, ms = 400 } } })
+    assert(#f:view().series == 1, 'a saved 55 s round trip is dropped on load')
+    f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', rtt_ms = 30000, detail = { fingerprint = 'relay-pin' } } }
+    f:complete(f:value('ready', 'tls'))
+    assert(#f:view().series == 1 and f:view().text == '已连接', 'a 30 s estimate is neither graphed nor shown')
+end
+
+function cases.relay_between_allocations_is_starting_not_unavailable()
+    local f = fixture('macos', true, true)
+    local value = f:value('ready', 'tls')
+    value.ok, value.state = false, 'starting'
+    f:complete(value)
+    assert(f:view().text == '启动中' and f:view().tone ~= 'error', f:view().text)
 end
 
 return { run = function()
