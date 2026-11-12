@@ -29,9 +29,9 @@ local statusText = "TURN · 已停止"
 -- relay's throughput from its byte counters.
 local HISTORY_KEEP = 120
 local HISTORY_WINDOW_S = 360
-local RTT_FLOOR_MS = 600
+local RTT_MIN_SCALE_MS = 100
 local RTT_SLOW_MS = 800
-local RATE_FLOOR = 64 * 1024
+local RATE_MIN_SCALE = 1024
 local RTT_KV = "rtt-history"
 local RATE_KV = "rate-history"
 local rtt = { samples = {}, at = nil, last = nil, median = nil, max = nil, unsaved = 0 }
@@ -1169,6 +1169,31 @@ local PILL = {
 local CHART_W = 272
 local CHART_H = 56
 local COMPACT = { "B", "K", "M", "G" }
+local RATE_UNITS = { "B", "KiB", "MiB", "GiB" }
+
+-- The smallest 1, 2 or 5 × 10^n at or above `value`: a chart's top follows its own
+-- peak (12.2 → 20) instead of a fixed floor that flattens quiet traffic.
+local function niceCeil(value)
+    local magnitude = 10 ^ math.floor(math.log10(value))
+    for _, step in ipairs({ 1, 2, 5, 10 }) do
+        if value <= step * magnitude then return step * magnitude end
+    end
+    return 10 * magnitude
+end
+
+-- The latency chart's top in ms and its label.
+local function rttScale()
+    local top = niceCeil(math.max(rtt.max or 0, RTT_MIN_SCALE_MS))
+    return top, string.format("%g ms", top)
+end
+
+-- A byte rate chart's top, rounded within its unit (12.2 KiB/s → 20 KiB/s), and its label.
+local function rateScale(peak)
+    local value, unit = math.max(peak, RATE_MIN_SCALE), 1
+    while value >= 1024 and unit < #RATE_UNITS do value /= 1024; unit += 1 end
+    local top = niceCeil(value)
+    return top * 1024 ^ (unit - 1), string.format("%g %s/s", top, RATE_UNITS[unit])
+end
 
 local function speed(value) return bytes(value) .. "/s" end
 
@@ -1303,17 +1328,18 @@ end
 local function rttChart()
     local values = table.create(#rtt.samples)
     for index, sample in ipairs(rtt.samples) do values[index] = sample.ms end
-    local line, y = points(values, math.max(RTT_FLOOR_MS, rtt.max) * 1.1)
+    local scale, label = rttScale()
+    local line, y = points(values, scale)
     local median = y(rtt.median)
-    return chartSvg(line, string.format("0,%.1f %d,%.1f", median, CHART_W, median))
+    return chartSvg(line, string.format("0,%.1f %d,%.1f", median, CHART_W, median)), label
 end
 
 -- Download as the area, upload dashed, on one scale.
 local function rateChart()
     local down, up = table.create(#rate.samples), table.create(#rate.samples)
     for index, sample in ipairs(rate.samples) do down[index] = sample.down; up[index] = sample.up end
-    local scale = math.max(RATE_FLOOR, rate.peakDown, rate.peakUp) * 1.1
-    return chartSvg((points(down, scale)), (points(up, scale)))
+    local scale, label = rateScale(math.max(rate.peakDown, rate.peakUp))
+    return chartSvg((points(down, scale)), (points(up, scale))), label
 end
 
 -- Tern's card has no hero, pill, chart or sections for plugins; this sheet draws them
@@ -1337,9 +1363,11 @@ local function cardCss(marks, tone)
         table.insert(css, row(marks.hero) .. ' .wgc-k::after { content: "ms"; margin-left: 4px; font: 400 13px var(--sans);'
             .. " letter-spacing: 0; color: var(--t3); }")
     end
-    local function chart(index, svg)
-        table.insert(css, row(index) .. " { padding-top: 62px; min-height: 18px; line-height: 18px;"
+    local function chart(index, svg, label)
+        table.insert(css, row(index) .. " { position: relative; padding-top: 62px; min-height: 18px; line-height: 18px;"
             .. ' background: url("data:image/svg+xml;utf8,' .. svg .. '") 0 2px / 100% ' .. CHART_H .. "px no-repeat; }")
+        table.insert(css, row(index) .. "::before { content: " .. quoted(label) .. "; position: absolute; top: 0; right: 0;"
+            .. " font: 10.5px/12px var(--mono); color: var(--t4); }")
         table.insert(css, row(index) .. " .wgc-k, " .. row(index) .. " .wgc-v { font-size: 11.5px; color: var(--t3); }")
         table.insert(css, row(index) .. " .wgc-v { max-width: none; }")
     end
@@ -1394,7 +1422,7 @@ tern.chrome.widget("turn", {
         local rows = cardRows(review, action)
         local series = nil
         if #rtt.samples > 0 then
-            local scale = math.max(RTT_FLOOR_MS, rtt.max)
+            local scale = rttScale()
             series = table.create(#rtt.samples)
             for index, sample in ipairs(rtt.samples) do series[index] = math.min(sample.ms / scale, 1) end
         end
@@ -1419,7 +1447,7 @@ tern.chrome.widget("rate", {
         local rows = cardRows(review, action)
         local series = nil
         if #rate.samples > 0 then
-            local scale = math.max(RATE_FLOOR, rate.peakDown)
+            local scale = rateScale(rate.peakDown)
             series = table.create(#rate.samples)
             for index, sample in ipairs(rate.samples) do series[index] = math.min(sample.down / scale, 1) end
         end

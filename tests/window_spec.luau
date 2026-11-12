@@ -385,8 +385,8 @@ function cases.widget_graphs_tern_rtt_and_reconnects_only_a_host_tern_gave_up()
         f:complete(f:value('ready', 'tls'))
     end
     local view = f:view()
-    assert(#view.series == 3 and view.series[1] == 0.2 and view.series[2] == 1 and view.series[3] == 0.3,
-        'RTT graph keeps samples oldest first, scaled to the peak')
+    assert(#view.series == 3 and view.series[1] == 0.15 and view.series[2] == 0.75 and view.series[3] == 0.225,
+        'RTT graph keeps samples oldest first, scaled to the peak rounded up to 1/2/5 (1500 → 2000)')
     assert(view.text == '450 ms', 'a connected bar shows only its latency')
     assert(view.title:find('中位 450 · 峰值 1500 ms', 1, true))
     assert(view.command == nil, 'a connected Host is never reconnected by a click')
@@ -416,8 +416,9 @@ function cases.card_sheet_styles_the_rows_it_describes()
     assert(sheet and sheet:find('.wgc-head::after { content: "已连接"', 1, true), 'the head pill names the phase')
     assert(sheet:find('radial-gradient(circle at 9px 50%, var(--warn)', 1, true), 'a slow connection tints the pill')
     assert(f:view().title:match('^1200: TLS · server\n'), 'the hero pairs the latency figure with mode and target')
-    assert(sheet:find('.wgc-row:nth-child(2) { padding-top: 62px', 1, true) and sheet:find('data:image/svg+xml', 1, true),
+    assert(sheet:find('.wgc-row:nth-child(2) { position: relative; padding-top: 62px', 1, true) and sheet:find('data:image/svg+xml', 1, true),
         'the graph row carries the chart')
+    assert(sheet:find('.wgc-row:nth-child(2)::before { content: "2000 ms"', 1, true), 'the chart labels its rounded-up top')
     assert(f:view().tone == 'warn', 'a slow connection warns in the bar')
     f.time += 3000; f:flush()
     f:complete({ ok = false, error = 'control unavailable' }, 1)
@@ -487,6 +488,7 @@ function cases.throughput_is_counter_delta_and_restarts_after_a_reset()
     poll(1024 + 3 * 512 * 1024, 0)
     assert(f.widgets.rate.render(nil).text == '↓512K ↑0B')
     assert(f:view().title:find('峰值 ↓1.0 MiB/s · ↑1.0 KiB/s', 1, true), 'the peak spans the whole history')
+    assert(f.sheets.card:find('content: "1 MiB/s"', 1, true), 'the throughput chart tops at the rounded-up peak')
 end
 
 return { run = function()
