@@ -217,8 +217,12 @@ function cases.failed_relay_with_selected_route_resumes_with_backoff_without_toa
         f.time = 3000; f:flush()
         f:complete(f:value('stopped', intent ~= 'none' and intent or nil))
         if intent == 'none' then
+            -- The poll armed before this answer still runs once; nothing follows it.
             f.time = 60000; f:flush()
-            assert(#f.calls == 2, '已撤销选择的后台不得自动恢复或继续轮询')
+            assert(#f.calls == 3 and f.calls[3].argv[6] == 'status')
+            f:complete(f:value('stopped'))
+            f.time = 120000; f:flush()
+            assert(#f.calls == 3, '已撤销选择的后台不得自动恢复或继续轮询')
         else
             assert(#f.calls == 3 and f.calls[3].argv[6] == 'resume', '保留选择的后台退出后应自动恢复')
             f:complete({ ok = false, error = 'TURN network operation timed out' }, 1)
