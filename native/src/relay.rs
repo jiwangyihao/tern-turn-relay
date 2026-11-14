@@ -692,10 +692,15 @@ async fn udp_receiver(shared: Arc<Shared>, socket: Arc<UdpSocket>) -> Result<()>
         }
         let handle = {
             let mut state = shared.state.lock().unwrap();
+            // A failed service must idle out so `resume` can replace it. Tern retries
+            // every few seconds, so its packets must not keep that service alive.
+            if shared.fatal.is_cancelled() {
+                continue;
+            }
             state.no_clients_since = Instant::now();
             state.demand = state.demand.wrapping_add(1);
             shared.demand.notify_one();
-            if !state.route_available || shared.fatal.is_cancelled() {
+            if !state.route_available {
                 continue;
             }
             if length > MAX_PAYLOAD {
@@ -2475,6 +2480,32 @@ mod tests {
             stop: CancellationToken::new(),
             fatal: CancellationToken::new(),
             demand: Notify::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_retries_hold_a_live_service_but_not_a_failed_one() {
+        for fatal in [false, true] {
+            let shared = Arc::new(recovery_shared());
+            let idle_since = Instant::now().checked_sub(SERVICE_IDLE).unwrap();
+            {
+                let mut state = shared.state.lock().unwrap();
+                state.route_available = false;
+                state.no_clients_since = idle_since;
+            }
+            if fatal {
+                shared.fatal.cancel();
+            }
+            let socket = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+            let address = socket.local_addr().unwrap();
+            let receiver = tokio::spawn(udp_receiver(shared.clone(), socket));
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            client.send_to(b"tern retry", address).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let held = shared.state.lock().unwrap().no_clients_since != idle_since;
+            assert_eq!(held, !fatal, "fatal={fatal}: Tern's retries must not keep a failed relay from idling out");
+            shared.stop.cancel();
+            timeout(Duration::from_secs(2), receiver).await.unwrap().unwrap().unwrap();
         }
     }
 

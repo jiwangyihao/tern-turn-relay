@@ -207,6 +207,34 @@ function cases.startup_resume_requires_intent_matching_config_and_exact_host()
     end
 end
 
+function cases.failed_relay_with_selected_route_resumes_with_backoff_without_toasts()
+    for _, intent in ipairs({ 'tls', 'none' }) do
+        local f = fixture('macos', true, true)
+        f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377',
+            state = 'disconnected', detail = { fingerprint = 'relay-pin' } } }
+        f:complete(f:value('ready'))
+        -- The relay failed fatally and idled out; only Stop/restore revoke the selection.
+        f.time = 3000; f:flush()
+        f:complete(f:value('stopped', intent ~= 'none' and intent or nil))
+        if intent == 'none' then
+            f.time = 60000; f:flush()
+            assert(#f.calls == 2, '已撤销选择的后台不得自动恢复或继续轮询')
+        else
+            assert(#f.calls == 3 and f.calls[3].argv[6] == 'resume', '保留选择的后台退出后应自动恢复')
+            f:complete({ ok = false, error = 'TURN network operation timed out' }, 1)
+            f.time = 6000; f:flush()
+            f:complete(f:value('stopped', intent))
+            assert(#f.calls == 4 and f.calls[4].argv[6] == 'status', '失败后按退避等待，不得立即重试')
+            f.time = 33000; f:flush()
+            f:complete(f:value('stopped', intent))
+            assert(#f.calls == 6 and f.calls[6].argv[6] == 'resume', '退避到期后再次恢复')
+            f:complete(f:value('ready'))
+            assert(not f:view().text:find('已停止'))
+        end
+        assert(#f.toasts == 0 and f.mutations == 0, '自动恢复不弹通知、不修改 Host')
+    end
+end
+
 function cases.periodic_status_is_live_deduplicated_and_failure_invalidates_ready()
     local f = fixture('windows', true, true)
     f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', detail = { fingerprint = 'relay-pin' } } }

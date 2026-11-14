@@ -410,7 +410,11 @@ pub(crate) mod linux {
         }
         Ok((credentials.pid as u32, credentials.uid))
     }
-    const UPDATE_WAIT: Duration = Duration::from_secs(8);
+    // An in-place Tern update renames the new executable, then the daemon re-execs and
+    // restores its panes. With 126 panes that took 7–10 s (0.9.20/0.9.21 updates), so
+    // 8 s failed a legitimate upgrade as identity_mismatch. Pongs continue meanwhile;
+    // stay below the 45 s heartbeat and the client's 50 s gateway open.
+    const UPDATE_WAIT: Duration = Duration::from_secs(30);
     // Bound both individual files and cumulative IO during one pending update.
     // A current Tern is ~197 MiB. Never allocate or seek a whole executable.
     const EXECUTABLE_MAX: u64 = 256 * 1024 * 1024;

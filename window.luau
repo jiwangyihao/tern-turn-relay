@@ -1,5 +1,5 @@
 local function install(tern)
--- Window-only: startup may resume an explicitly selected backend, never a native connection.
+-- Window-only: startup and polling may resume an explicitly selected backend, never a native connection.
 local platform = require('./platform').new(tern.runtime, tern.plugin, tern.getenv)
 local configPath = tern.plugin.data .. "/config.json"
 local stateDir = tern.plugin.data .. "/runtime"
@@ -57,6 +57,10 @@ local SILENT_RECONNECT_MS = 30000
 local RECONNECT_RETRY_MS = 30000
 local RECONNECT_RETRY_MAX_MS = 300000
 local auto = { reason = nil, since = nil, nextAt = 0, delay = RECONNECT_RETRY_MS }
+-- A relay that failed or exited while its route is still selected is resumed with the
+-- same backoff; startup and automatic attempts share it, and a ready relay resets it.
+local backend = { nextAt = 0, delay = RECONNECT_RETRY_MS }
+local watchBackend
 -- A round trip of seconds is a stalled link's estimate (55 s after a wake), not a path.
 local RTT_MAX_SAMPLE_MS = 10000
 local helperRequests = {}
@@ -584,7 +588,7 @@ schedule = function()
     -- Native Tern reconnects independently; a disconnected Host must not stop
     -- observation of a live backend or freeze its last recovery snapshot.
     if timer or not (pending or busy or cache.state == "ready" or cache.state == "starting"
-        or (hasConfig and helperReady and cache.state == "error")) then return end
+        or (hasConfig and helperReady and (cache.state == "error" or (cache.state == "stopped" and cache.resume_mode)))) then return end
     local token = generation
     pollDue = tern.now() + POLL_MS
     timer = tern.timer(POLL_MS, function(_fresh)
@@ -608,6 +612,7 @@ schedule = function()
                 inspectNative(current)
                 refresh()
                 if watchSession then watchSession(current) end
+                if watchBackend then watchBackend(current) end
                 schedule()
             end, "poll")
         end)
@@ -851,6 +856,40 @@ local function cancelStartup()
     if startupTimer then startupTimer:cancel(); startupTimer = nil end
 end
 
+-- Resume the saved selection for the exact configured target. The helper re-runs every
+-- native check and never rebinds the pinned gateway or daemon, so retrying cannot weaken
+-- verification. Never add, switch, disconnect or trust here: native Tern owns reconnect
+-- and first-contact verification; restoring the local listener cannot pin a Host.
+local function resumeBackend(cx, token, mode, config, automatic)
+    backend.nextAt = tern.now() + backend.delay
+    backend.delay = math.min(backend.delay * 2, RECONNECT_RETRY_MAX_MS)
+    busy = "resume"
+    lastError = nil
+    refresh()
+    helper("resume", nil, token, cx, function(resumed, err, fresh)
+        busy = nil
+        if stopAfterResume then
+            stopAfterResume = false
+            disconnect(fresh)
+            return
+        end
+        if resumed then accept(resumed) end
+        local problem = err
+        if not problem and (not sameTarget(resumed, config) or resumed.state == "starting"
+            or (resumed.state == "ready" and resumed.mode ~= mode)) then
+            problem = "Helper did not confirm the configured target and saved mode."
+        end
+        if problem then
+            if cache.state == "starting" then cache.state = "error" end
+            -- An automatic attempt retries by itself; the card carries the reason.
+            report(not automatic and fresh or nil, problem)
+        end
+        inspectNative(fresh)
+        refresh()
+        schedule()
+    end)
+end
+
 -- Discovery is startup-only and bounded. Only an authoritative helper response can
 -- authorize resume; status.json is never evidence of durable intent or liveness.
 local function discoverStartup(cx, request, authoritative)
@@ -888,7 +927,7 @@ local function discoverStartup(cx, request, authoritative)
         return
     end
     local value = request.status
-    cancelStartup() -- One attempt per load, including failure or an unknown outcome.
+    cancelStartup() -- One startup attempt; later ones follow watchBackend's backoff.
     if value.state ~= "stopped" or not value.resume_mode then schedule(); return end
     local config = targetConfig(cx)
     if not config or not sameTarget(value, config) then
@@ -900,31 +939,7 @@ local function discoverStartup(cx, request, authoritative)
         report(cx, "Startup Host fingerprint differs from the configured target; recovery was refused.")
         return
     end
-    -- Never add, switch, disconnect or trust here. Native Tern owns reconnect and
-    -- first-contact verification; restoring the local listener cannot pin a Host.
-    busy = "resume"
-    lastError = nil
-    refresh()
-    helper("resume", nil, request.token, cx, function(resumed, err, fresh)
-        busy = nil
-        if stopAfterResume then
-            stopAfterResume = false
-            disconnect(fresh)
-            return
-        end
-        if resumed then accept(resumed) end
-        if err then
-            if cache.state == "starting" then cache.state = "error" end
-            report(fresh, err)
-        elseif not sameTarget(resumed, config) or resumed.state == "starting"
-            or (resumed.state == "ready" and resumed.mode ~= value.resume_mode) then
-            if cache.state == "starting" then cache.state = "error" end
-            report(fresh, "Startup helper did not confirm the configured target and saved mode.")
-        end
-        inspectNative(fresh)
-        refresh()
-        schedule()
-    end)
+    resumeBackend(cx, request.token, value.resume_mode, config, false)
 end
 
 local function prepare(cx, allowLocal)
@@ -1318,6 +1333,23 @@ watchSession = function(cx)
     auto.nextAt = now + auto.delay
     auto.delay = math.min(auto.delay * 2, RECONNECT_RETRY_MAX_MS)
     reconnect(cx, true)
+end
+
+-- Only Stop and a clean restore revoke the selection, so `stopped` with a resume mode is
+-- a relay that failed or exited on its own. A fatally failed relay reports `error` until
+-- it idles out, then `stopped`; resume then replaces it without user action.
+watchBackend = function(cx)
+    if cache.state == "ready" then backend.nextAt = 0; backend.delay = RECONNECT_RETRY_MS; return end
+    if not cx or cache.state ~= "stopped" or not cache.resume_mode or not hasConfig or not helperReady
+        or busy or pending or startup or stopAfterResume or reviewing()
+        or (onboarding and onboarding.active) or tern.now() < backend.nextAt then return end
+    local config = targetConfig(nil)
+    if not config or not sameTarget(cache, config) then return end
+    local ok, host = pcall(exactHost, cx, config.address)
+    if not ok or not host then return end
+    local fingerprint = host.detail and host.detail.fingerprint
+    if fingerprint and fingerprint ~= config.relayFingerprint then return end
+    resumeBackend(cx, generation, cache.resume_mode, config, true)
 end
 
 local function span(seconds)
