@@ -5,6 +5,9 @@ local configPath = tern.plugin.data .. "/config.json"
 local stateDir = tern.plugin.data .. "/runtime"
 local MAX_JSON = 16384
 local POLL_MS = 3000
+-- A configured window observes a stopped relay this often, so one started elsewhere
+-- (another window, the CLI) does not leave it showing 已停止 until a reload.
+local IDLE_POLL_MS = 30000
 local CONNECT_MS = 45000
 local STARTUP_MS = 30000
 local HELPER_GRACE_MS = 2000
@@ -37,6 +40,7 @@ local RATE_KV = "rate-history"
 local rtt = { samples = {}, at = nil, last = nil, median = nil, max = nil, unsaved = 0 }
 local rate = { samples = {}, prev = nil, up = nil, down = nil, peakUp = 0, peakDown = 0, unsaved = 0 }
 local pollDue = nil
+local pollIdle = false
 local lastStatusAt = nil
 local installedCss = nil
 local paint
@@ -588,11 +592,22 @@ end
 schedule = function()
     -- Native Tern reconnects independently; a disconnected Host must not stop
     -- observation of a live backend or freeze its last recovery snapshot.
-    if timer or not (pending or busy or cache.state == "ready" or cache.state == "starting"
-        or (hasConfig and helperReady and (cache.state == "error" or (cache.state == "stopped" and cache.resume_mode)))) then return end
+    local active = pending or busy or cache.state == "ready" or cache.state == "starting"
+        or (hasConfig and helperReady and (cache.state == "error" or (cache.state == "stopped" and cache.resume_mode)))
+    if not active and not (hasConfig and helperReady) then return end
+    if timer then
+        -- A command or a live status must not wait out the idle interval.
+        if not (pollIdle and active) then return end
+        local idle = timer
+        timer = nil
+        pollDue = nil
+        pcall(function() idle:cancel() end)
+    end
+    local delay = active and POLL_MS or IDLE_POLL_MS
+    pollIdle = not active
     local token = generation
-    pollDue = tern.now() + POLL_MS
-    timer = tern.timer(POLL_MS, function(_fresh)
+    pollDue = tern.now() + delay
+    timer = tern.timer(delay, function(_fresh)
         timer = nil
         pollDue = nil
         if token ~= generation then schedule(); return end

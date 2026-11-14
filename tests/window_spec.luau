@@ -217,12 +217,13 @@ function cases.failed_relay_with_selected_route_resumes_with_backoff_without_toa
         f.time = 3000; f:flush()
         f:complete(f:value('stopped', intent ~= 'none' and intent or nil))
         if intent == 'none' then
-            -- The poll armed before this answer still runs once; nothing follows it.
+            -- A revoked selection is never resumed; only a slow, read-only status remains.
             f.time = 60000; f:flush()
-            assert(#f.calls == 3 and f.calls[3].argv[6] == 'status')
             f:complete(f:value('stopped'))
             f.time = 120000; f:flush()
-            assert(#f.calls == 3, '已撤销选择的后台不得自动恢复或继续轮询')
+            f:complete(f:value('stopped'))
+            assert(#f.calls == 4, '停止后只保留 30 秒一次的观察')
+            for i = 3, #f.calls do assert(f.calls[i].argv[6] == 'status', '已撤销选择的后台不得自动恢复') end
         else
             assert(#f.calls == 3 and f.calls[3].argv[6] == 'resume', '保留选择的后台退出后应自动恢复')
             f:complete({ ok = false, error = 'TURN network operation timed out' }, 1)
@@ -237,6 +238,23 @@ function cases.failed_relay_with_selected_route_resumes_with_backoff_without_toa
         end
         assert(#f.toasts == 0 and f.mutations == 0, '自动恢复不弹通知、不修改 Host')
     end
+end
+
+function cases.stopped_window_notices_a_relay_started_elsewhere()
+    local f = fixture('macos', true, true)
+    f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377',
+        state = 'connected', detail = { fingerprint = 'relay-pin' } } }
+    -- Loaded while stopped without a selection; another window or the CLI starts it.
+    f:complete(f:value('stopped'))
+    f.time = 29000; f:flush()
+    assert(#f.calls == 1, '停止时不按 3 秒频率查询')
+    f.time = 30000; f:flush()
+    assert(#f.calls == 2 and f.calls[2].argv[6] == 'status', '别处启动的后台须在 30 秒内被发现')
+    f:complete(f:value('ready'))
+    assert(f:view().text:find('已连接') and not f:view().text:find('已停止'))
+    f.time = 33000; f:flush()
+    assert(#f.calls == 3, '后台就绪后立即回到 3 秒轮询，不等满空闲间隔')
+    assert(f.mutations == 0)
 end
 
 function cases.periodic_status_is_live_deduplicated_and_failure_invalidates_ready()
