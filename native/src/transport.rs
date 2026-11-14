@@ -40,8 +40,11 @@ const OP_TIMEOUT: Duration = Duration::from_secs(18);
 const MARGIN: Duration = Duration::from_millis(250);
 const CHANNEL: u16 = 0x4000;
 const MAX_WIRE: usize = 65535;
-const RECEIVE_PACKETS: usize = 64;
-const RECEIVE_BYTES: usize = 256 * 1024;
+// Bounds of the receive path, which drops rather than block control behind payloads.
+// 64 packets held ~50 ms of a 1.5 MiB/s reattach burst; any longer stall of this
+// process dropped downlink data and cut Tern's QUIC rate. 1024 hold ~1 s.
+const RECEIVE_PACKETS: usize = 1024;
+const RECEIVE_BYTES: usize = 2 * 1024 * 1024;
 type Result<T, E = TransportError> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +230,8 @@ impl TransportError {
 #[derive(Clone, Copy, Default)]
 pub struct Stats {
     pub refreshes: u64,
+    /// Received datagrams dropped because the receive path was full.
+    pub dropped: u64,
 }
 struct State {
     allocation: Option<Instant>,
@@ -235,6 +240,7 @@ struct State {
     expires: f64,
     refreshes: u64,
     receive_bytes: usize,
+    dropped: u64,
 }
 struct Shared {
     state: StdMutex<State>,
@@ -391,7 +397,7 @@ async fn wire(
         .map_err(|_| TransportError::Network)?
         .find(SocketAddr::is_ipv4)
         .ok_or(TransportError::Configuration)?;
-    let (sender, receiver) = mpsc::channel(64);
+    let (sender, receiver) = mpsc::channel(RECEIVE_PACKETS);
     let cancel = shared.cancel.clone();
     if config.mode == Mode::Udp {
         let socket = Arc::new(
@@ -416,7 +422,8 @@ async fn wire(
                 let failed = result.is_err();
                 // UDP congestion is packet loss; never block control behind payloads.
                 match sender.try_send(result) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => shared.state.lock().unwrap().dropped += 1,
                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
                 if failed {
@@ -497,6 +504,7 @@ impl Endpoint {
                 expires: config.expires,
                 refreshes: 0,
                 receive_bytes: 0,
+                dropped: 0,
             }),
             cancel: CancellationToken::new(),
         });
@@ -548,6 +556,7 @@ impl Endpoint {
         let state = self.shared.state.lock().unwrap();
         Stats {
             refreshes: state.refreshes,
+            dropped: state.dropped,
         }
     }
     pub async fn failure(&self) -> TransportError {
@@ -735,11 +744,12 @@ impl Owner {
         }
         let mut state = self.shared.state.lock().unwrap();
         if state.receive_bytes + payload.len() > RECEIVE_BYTES {
+            state.dropped += 1;
             return Ok(());
         }
         match self.packets.try_send(payload.to_vec()) {
             Ok(()) => state.receive_bytes += payload.len(),
-            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => state.dropped += 1,
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(TransportError::Closed),
         }
         Ok(())
@@ -1262,7 +1272,7 @@ mod tests {
         let shared = Arc::new(Shared {
             state: StdMutex::new(State {
                 allocation: None, permission: None, error: None,
-                expires: config.expires, refreshes: 0, receive_bytes: 0,
+                expires: config.expires, refreshes: 0, receive_bytes: 0, dropped: 0,
             }),
             cancel: CancellationToken::new(),
         });
@@ -1316,6 +1326,7 @@ mod tests {
                 expires: common::unix_time() + 3600.0,
                 refreshes: 0,
                 receive_bytes: 0,
+                dropped: 0,
             }),
             cancel: CancellationToken::new(),
         };
@@ -1345,6 +1356,7 @@ mod tests {
                 expires: config.expires,
                 refreshes: 0,
                 receive_bytes: 0,
+                dropped: 0,
             }),
             cancel: CancellationToken::new(),
         });
@@ -1377,6 +1389,18 @@ mod tests {
         };
         owner.config.mode = mode;
         (owner, server, received)
+    }
+
+    #[tokio::test]
+    async fn full_receive_path_drops_and_counts_downlink_payloads() {
+        let (owner, _server, received) = test_owner(Mode::Udp).await;
+        for _ in 0..RECEIVE_PACKETS {
+            owner.packet(b"payload").unwrap();
+        }
+        assert_eq!(owner.shared.state.lock().unwrap().dropped, 0);
+        owner.packet(b"overflow").unwrap();
+        assert_eq!(received.len(), RECEIVE_PACKETS);
+        assert_eq!(owner.shared.state.lock().unwrap().dropped, 1);
     }
 
     fn success(
@@ -1795,6 +1819,7 @@ mod tests {
                 expires,
                 refreshes: 0,
                 receive_bytes: 0,
+                dropped: 0,
             }),
             cancel: CancellationToken::new(),
         });

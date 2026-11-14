@@ -159,6 +159,7 @@ local function decode(raw)
         or not count(value.queue_dropped_packets) or not count(value.queue_dropped_bytes)
         or (value.recovering_flows ~= nil and not count(value.recovering_flows))
         or (value.allocation_refreshes ~= nil and not count(value.allocation_refreshes))
+        or (value.downlink_dropped_packets ~= nil and not count(value.downlink_dropped_packets))
         or (value.recovery_error ~= nil and not text(value.recovery_error, 4096))
         or (value.gateway_recovering ~= nil and type(value.gateway_recovering) ~= "boolean")
         or (value.gateway_reconnects ~= nil and not count(value.gateway_reconnects))
@@ -1056,6 +1057,7 @@ local function showDetails(cx)
     row("当前恢复原因", cache.recovery_error)
     row("排队", tostring(cache.queued_packets) .. " 包 / " .. bytes(cache.queued_bytes))
     row("累计上行丢弃", tostring(cache.queue_dropped_packets) .. " 包 / " .. bytes(cache.queue_dropped_bytes))
+    row("累计下行丢弃", tostring(cache.downlink_dropped_packets or 0) .. " 包")
     row("当前拥塞", cache.congested and "是（可恢复）" or "否")
     table.insert(rows, "\n历史丢包不等于当前拥塞；SSH TCP 使用原 SSH 服务，不经 TURN。\n\n## 身份与后台\n\n| 项目 | 值 |\n| --- | --- |")
     row("路由策略", cache.route_policy)
@@ -1391,6 +1393,7 @@ local function cardRows(review, action)
         if endpoint then pair("入口", endpoint) end
         if cache.queued_packets > 0 then pair("排队", string.format("%d 包 · %s", cache.queued_packets, bytes(cache.queued_bytes))) end
         if cache.queue_dropped_packets > 0 then pair("上行丢弃", string.format("%d 包", cache.queue_dropped_packets)) end
+        if (cache.downlink_dropped_packets or 0) > 0 then pair("下行丢弃", string.format("%d 包", cache.downlink_dropped_packets)) end
         if cache.gateway_recovering then
             pair("网关", string.format("恢复中 · 第 %d 次", cache.gateway_reconnects or 0))
         elseif (cache.gateway_reconnects or 0) > 0 then

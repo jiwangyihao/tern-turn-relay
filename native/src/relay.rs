@@ -40,8 +40,10 @@ use tokio::net::{UnixListener as ControlListener, UnixStream as ControlStream};
 use crate::windows_ipc::{Listener as ControlListener, Stream as ControlStream};
 
 const MAX_FLOWS: usize = 16;
-const MAX_PACKETS: usize = 64;
-const MAX_BYTES: usize = 256 * 1024;
+// Upstream is mostly Tern's ~78-byte QUIC ACKs, 360+ per second during a reattach:
+// 64 packets held ~180 ms, and dropped ACKs stalled the server's sending.
+const MAX_PACKETS: usize = 1024;
+const MAX_BYTES: usize = 1024 * 1024;
 const ALLOCATION_DELAYS: [u64; 2] = [2, 5];
 const GATEWAY_DELAYS: [u64; 5] = [2, 5, 15, 30, 30];
 const COOLDOWN: Duration = Duration::from_secs(30);
@@ -250,6 +252,7 @@ struct ServiceState {
     gateway_failure_message: Option<&'static str>,
     recovery_error: Option<&'static str>,
     retired_refreshes: u64,
+    retired_drops: u64,
     bytes_up: u64,
     bytes_down: u64,
     dropped_packets: u64,
@@ -289,6 +292,7 @@ impl Shared {
         let mut bytes = 0;
         let mut recovering = 0;
         let mut refreshes = state.retired_refreshes;
+        let mut downlink_drops = state.retired_drops;
         let mut usable = false;
         let mut expires: Option<f64> = None;
         let mut recovery_error = state.recovery_error;
@@ -302,13 +306,17 @@ impl Shared {
             }
             if let Some(endpoint) = &flow.endpoint {
                 usable |= endpoint.usable();
-                refreshes += endpoint.stats().refreshes;
+                let stats = endpoint.stats();
+                refreshes += stats.refreshes;
+                downlink_drops += stats.dropped;
                 expires = Some(expires.map_or(endpoint.expires, |old| old.min(endpoint.expires)));
             }
         }
         if let Some(warm) = &state.warm {
             usable |= warm.usable();
-            refreshes += warm.stats().refreshes;
+            let stats = warm.stats();
+            refreshes += stats.refreshes;
+            downlink_drops += stats.dropped;
             expires = Some(expires.map_or(warm.expires, |old| old.min(warm.expires)));
         }
         usable &= state.route_available && !self.stop.is_cancelled();
@@ -325,6 +333,7 @@ impl Shared {
         result["queued_bytes"] = json!(bytes);
         result["queue_dropped_packets"] = json!(state.dropped_packets);
         result["queue_dropped_bytes"] = json!(state.dropped_bytes);
+        result["downlink_dropped_packets"] = json!(downlink_drops);
         result["congested"] = json!(state
             .last_drop
             .is_some_and(|at| at.elapsed() < Duration::from_secs(5)));
@@ -379,6 +388,11 @@ impl Shared {
             notified.await;
         }
     }
+    fn retire(&self, stats: crate::transport::Stats) {
+        let mut state = self.state.lock().unwrap();
+        state.retired_refreshes += stats.refreshes;
+        state.retired_drops += stats.dropped;
+    }
     fn record_drop(&self, bytes: usize) {
         let mut state = self.state.lock().unwrap();
         state.dropped_packets = state.dropped_packets.saturating_add(1);
@@ -408,7 +422,7 @@ async fn retire_endpoint(shared: &Shared, record: &FlowRecord) {
     let endpoint = record.data.lock().unwrap().endpoint.take();
     if let Some(endpoint) = endpoint {
         endpoint.close().await;
-        shared.state.lock().unwrap().retired_refreshes += endpoint.stats().refreshes;
+        shared.retire(endpoint.stats());
     }
 }
 
@@ -774,7 +788,7 @@ async fn retire_route(shared: &Shared) {
     let close_warm = async {
         if let Some(warm) = warm {
             warm.close().await;
-            shared.state.lock().unwrap().retired_refreshes += warm.stats().refreshes;
+            shared.retire(warm.stats());
         }
     };
     tokio::join!(close_flows, close_warm);
@@ -834,7 +848,7 @@ where
     };
     if installed {
         warm.close().await;
-        shared.state.lock().unwrap().retired_refreshes += warm.stats().refreshes;
+        shared.retire(warm.stats());
     } else {
         // UDP may have claimed the warm endpoint during preparation. Its flow
         // now owns rotation; never install a second, orphaned warm allocation.
@@ -1546,6 +1560,7 @@ async fn serve(
             gateway_failure_message: None,
             recovery_error: None,
             retired_refreshes: 0,
+            retired_drops: 0,
             bytes_up: 0,
             bytes_down: 0,
             dropped_packets: 0,
@@ -2461,6 +2476,7 @@ mod tests {
                 gateway_failure_message: None,
                 recovery_error: None,
                 retired_refreshes: 0,
+                retired_drops: 0,
                 bytes_up: 0,
                 bytes_down: 0,
                 dropped_packets: 0,
@@ -2942,11 +2958,12 @@ mod tests {
         assert_eq!(data.demand, MAX_PACKETS as u64 + 1);
         drop(data);
         let record = FlowRecord::new(None);
-        for _ in 0..4 {
+        let fitting = MAX_BYTES / 65000;
+        for _ in 0..fitting {
             assert!(record.enqueue(&vec![1; 65000]));
         }
         assert!(!record.enqueue(&vec![1; 65000]));
-        assert_eq!(record.data.lock().unwrap().bytes, 260000);
+        assert_eq!(record.data.lock().unwrap().bytes, fitting * 65000);
     }
 
     #[test]
