@@ -1983,13 +1983,17 @@ pub(crate) mod linux {
             });
         }
     }
+    // Datagrams drained per readiness event. One per poll left bursts queued behind the
+    // control and identity checks until the 208 KiB default buffer overflowed.
+    const BATCH: usize = 64;
+    /// Ok(false) once the public socket is empty.
     fn forward(
         public: &UdpSocket,
         native: u16,
         key: &[u8; 32],
         flows: &mut FlowTable,
         buffer: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (size, peer) = match public.recv_from(buffer) {
             Ok(v) => v,
             Err(e)
@@ -1998,18 +2002,18 @@ pub(crate) mod linux {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionRefused
                 ) =>
             {
-                return Ok(())
+                return Ok(false)
             }
             Err(_) => return Err(failure("unknown")),
         };
         let Some((id, sequence, payload)) =
             protocol::decode(key, protocol::CLIENT_TO_SERVER, &buffer[..size])
         else {
-            return Ok(());
+            return Ok(true);
         };
         if !flows.identities.contains_key(&id) {
             if flows.identities.len() >= 4096 {
-                return Ok(());
+                return Ok(true);
             }
             flows.identities.insert(
                 id,
@@ -2028,20 +2032,21 @@ pub(crate) mod linux {
             .ok_or_else(|| failure("unknown"))?;
         let newer = sequence > flow.replay.highest();
         if !flow.replay.accept(sequence) {
-            return Ok(());
+            return Ok(true);
         }
         if newer {
             flow.peer = peer;
         }
         if flow.socket.is_none() {
             if flows.active.len() >= 16 {
-                return Ok(());
+                return Ok(true);
             }
             let socket =
                 UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|_| failure("unknown"))?;
             socket
                 .set_nonblocking(true)
                 .map_err(|_| failure("unknown"))?;
+            common::widen_udp(&socket);
             socket
                 .connect((Ipv4Addr::LOCALHOST, native))
                 .map_err(|_| failure("unknown"))?;
@@ -2052,8 +2057,9 @@ pub(crate) mod linux {
         if let Some(socket) = &flow.socket {
             let _ = socket.send(payload);
         }
-        Ok(())
+        Ok(true)
     }
+    /// Ok(false) once the flow's socket is empty.
     fn reply(
         public: &UdpSocket,
         key: &[u8; 32],
@@ -2061,16 +2067,16 @@ pub(crate) mod linux {
         flow: &mut Flow,
         buffer: &mut [u8],
         encoded: &mut Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(socket) = flow.socket.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         let size = match socket.recv(buffer) {
             Ok(size) => size,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(false),
         };
         if size > protocol::MAX_PAYLOAD {
-            return Ok(());
+            return Ok(true);
         }
         flow.sequence = flow
             .sequence
@@ -2087,7 +2093,7 @@ pub(crate) mod linux {
         .map_err(|_| failure("protocol_error"))?;
         let _ = public.send_to(encoded, flow.peer);
         flow.active = Instant::now();
-        Ok(())
+        Ok(true)
     }
     fn frontend_relay_args(version: &[u8]) -> Result<&'static [&'static str]> {
         let text = std::str::from_utf8(version).map_err(|_| failure("protocol_error"))?;
@@ -2152,6 +2158,7 @@ pub(crate) mod linux {
         public
             .set_nonblocking(true)
             .map_err(|_| failure("security_error"))?;
+        common::widen_udp(&public);
         let port = public.local_addr().map_err(|_| failure("unknown"))?.port();
         if port < 1024 {
             return Err(failure("security_error"));
@@ -2305,12 +2312,16 @@ pub(crate) mod linux {
                 continue;
             }
             if fds[1].revents & libc::POLLIN != 0 {
-                forward(&public, native_port, &key.0, &mut flows, &mut incoming)?;
+                for _ in 0..BATCH {
+                    if !forward(&public, native_port, &key.0, &mut flows, &mut incoming)? { break; }
+                }
             }
             for (index, id) in ids.iter().enumerate() {
                 if fds[index + 2].revents & libc::POLLIN != 0 {
                     if let Some(flow) = flows.identities.get_mut(id) {
-                        reply(&public, &key.0, *id, flow, &mut reply_buffer, &mut encoded)?;
+                        for _ in 0..BATCH {
+                            if !reply(&public, &key.0, *id, flow, &mut reply_buffer, &mut encoded)? { break; }
+                        }
                     }
                 }
             }

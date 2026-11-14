@@ -399,6 +399,7 @@ async fn wire(
                 .await
                 .map_err(|_| TransportError::Network)?,
         );
+        common::widen_udp(&*socket);
         socket
             .connect(address)
             .await

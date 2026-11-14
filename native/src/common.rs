@@ -712,6 +712,45 @@ pub fn load_config(path: &Path, allow_unprovisioned: bool) -> Result<Value> {
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+/// Tern's bursts run at tens of Mbit/s. Default UDP buffers (208 KiB on Linux, 768 KiB
+/// on macOS) overflow whenever a relay reader stalls briefly, and every drop is a QUIC
+/// loss event that cuts Tern's sending rate. Best effort: the OS may cap the request.
+pub const UDP_BUFFER: i32 = 4 * 1024 * 1024;
+#[cfg(unix)]
+pub fn widen_udp(socket: &impl AsRawFd) {
+    // Linux caps SO_RCVBUF at rmem_max unless the owner may force it; macOS refuses a
+    // request above its socket-buffer limit, so halve until one is accepted.
+    #[cfg(target_os = "linux")]
+    const OPTIONS: [&[libc::c_int]; 2] =
+        [&[libc::SO_RCVBUFFORCE, libc::SO_RCVBUF], &[libc::SO_SNDBUFFORCE, libc::SO_SNDBUF]];
+    #[cfg(not(target_os = "linux"))]
+    const OPTIONS: [&[libc::c_int]; 2] = [&[libc::SO_RCVBUF], &[libc::SO_SNDBUF]];
+    for candidates in OPTIONS {
+        let mut size = UDP_BUFFER;
+        'size: while size >= 256 * 1024 {
+            for &option in candidates {
+                if unsafe {
+                    libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, option,
+                        (&size as *const i32).cast(), std::mem::size_of::<i32>() as libc::socklen_t)
+                } == 0 {
+                    break 'size;
+                }
+            }
+            size /= 2;
+        }
+    }
+}
+#[cfg(windows)]
+pub fn widen_udp(socket: &impl std::os::windows::io::AsRawSocket) {
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+    for option in [SO_RCVBUF, SO_SNDBUF] {
+        unsafe {
+            setsockopt(socket.as_raw_socket() as _, SOL_SOCKET, option,
+                (&UDP_BUFFER as *const i32).cast(), std::mem::size_of::<i32>() as i32);
+        }
+    }
+}
+
 pub fn ssh_args(alias: &str, remote_command: &str) -> Vec<String> {
     let mut args = vec!["-T".to_owned()];
     for option in [

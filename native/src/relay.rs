@@ -652,6 +652,7 @@ async fn bind_loopback_udp(port: u16) -> Result<UdpSocket> {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
         .await
         .map_err(|_| Error::new("udp_bind", "Cannot bind the loopback UDP relay port."))?;
+    common::widen_udp(&socket);
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawSocket;
