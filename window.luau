@@ -1241,8 +1241,11 @@ local function clickAction(review)
 end
 
 local BACKEND = { ready = "就绪", starting = "启动中", stopped = "已停止", error = "不可用" }
+local BACKEND_TONE = { ready = "ok", starting = "warn", stopped = "muted", error = "error" }
+local HEALTH_TONE = { ok = "ok", warn = "warn", bad = "error" }
 -- Both widgets (latency and throughput) share one card.
 local CARD = '.kit-popover.wgc[data-widget^="tern-turn-relay/"]'
+local CARD_TEXT_MAX = 200
 -- Status pill in the card head, as Memory's: dot color, then tint.
 local PILL = {
     ok = { "var(--ok)", "rgb(from var(--ok) r g b / 12%)" },
@@ -1374,57 +1377,93 @@ local function span(seconds)
     return string.format("近 %d 分钟", math.floor(seconds / 60 + 0.5))
 end
 
--- The card is the `title` rows Tern draws; a "key: value" line becomes two columns. The
--- marks name the rows the card sheet styles: hero, graph, section, problem and foot.
+-- At most `max` characters: Tern leaves out a card row whose label or text is longer.
+local function clip(value, max)
+    local text = (tostring(value):gsub("[%c]", " "))
+    local length = utf8.len(text)
+    if not length or length <= max then return text end
+    return string.sub(text, 1, utf8.offset(text, max) - 1) .. "…"
+end
+
+-- The relay row's buttons: re-attach Tern's session to a ready relay, or stop a relay
+-- that runs or is due to resume. None while an operation or review is in progress.
+local function relayActions(review)
+    if review or not hasConfig or not helperReady or busy or pending then return nil end
+    local actions = {}
+    if cache.state == "ready" then table.insert(actions, { id = "reconnect", label = "重连" }) end
+    if cache.state ~= "stopped" or cache.resume_mode then table.insert(actions, { id = "stop", label = "停止" }) end
+    return #actions > 0 and actions or nil
+end
+
+-- The card is native `card` rows: label, text, tone and buttons. Tern has no hero, pill,
+-- chart or sections for plugin cards yet, so `cardCss` draws them over these rows by
+-- position; marks name those rows. Drop that drawing once Tern offers them.
 local function cardRows(review, action)
     local rows, marks = {}, {}
-    local function add(line) table.insert(rows, (line:gsub("[%c]", " "))); return #rows end
-    local function pair(key, value)
-        local shown = string.gsub(tostring(value), ": ", "：")
-        return add(key .. ": " .. shown)
+    local function add(row)
+        row.text = clip(row.text, CARD_TEXT_MAX)
+        if row.label then row.label = clip(row.label, CARD_TEXT_MAX) end
+        table.insert(rows, row)
+        return #rows
     end
+    local function pair(label, text, tone) return add({ label = label, text = text, tone = tone }) end
+    local heroTone = HEALTH_TONE[health()]
     local configured = hasConfig and helperReady and not review
     if configured then
         local name = cache.target and cache.target.name
-        marks.hero = pair(heroText(review), (cache.mode and string.upper(cache.mode) or "TURN") .. (name and " · " .. name or ""))
+        marks.hero = pair(heroText(review), (cache.mode and string.upper(cache.mode) or "TURN") .. (name and " · " .. name or ""), heroTone)
     else
-        marks.hero = add(heroText(review))
+        marks.hero = pair(heroText(review), "", heroTone)
     end
     if #rtt.samples > 0 then
-        marks.graph = pair(span(os.time() - rtt.samples[1].t), string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max))
+        marks.graph = pair(span(os.time() - rtt.samples[1].t), string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max), "muted")
     end
     if hasConfig and not review and (rate.down or #rate.samples > 0) then
         marks.rate = pair("吞吐", rate.down and ("↓" .. speed(rate.down) .. " · ↑" .. speed(rate.up)) or "—")
         if #rate.samples > 0 then
             marks.rateGraph = pair(span(os.time() - rate.samples[1].t),
-                "峰值 ↓" .. speed(rate.peakDown) .. " · ↑" .. speed(rate.peakUp))
+                "峰值 ↓" .. speed(rate.peakDown) .. " · ↑" .. speed(rate.peakUp), "muted")
         end
     end
     if hasConfig and not review then
-        marks.section = pair("中继", BACKEND[cache.state] or cache.state)
+        marks.section = add({ id = "relay", label = "中继", text = BACKEND[cache.state] or cache.state,
+            tone = BACKEND_TONE[cache.state], actions = relayActions(review) })
         pair("连接", string.format("TURN %d · SSH %d", cache.flows, cache.ssh_connections))
         pair("流量", "↑" .. bytes(cache.bytes_up) .. " ↓" .. bytes(cache.bytes_down))
         local endpoint = cache.address and cache.address:match("@(.+)$")
         if endpoint then pair("入口", endpoint) end
         if cache.queued_packets > 0 then pair("排队", string.format("%d 包 · %s", cache.queued_packets, bytes(cache.queued_bytes))) end
-        if cache.queue_dropped_packets > 0 then pair("上行丢弃", string.format("%d 包", cache.queue_dropped_packets)) end
-        if (cache.downlink_dropped_packets or 0) > 0 then pair("下行丢弃", string.format("%d 包", cache.downlink_dropped_packets)) end
+        if cache.queue_dropped_packets > 0 then pair("上行丢弃", string.format("%d 包", cache.queue_dropped_packets), "warn") end
+        if (cache.downlink_dropped_packets or 0) > 0 then pair("下行丢弃", string.format("%d 包", cache.downlink_dropped_packets), "warn") end
         if cache.gateway_recovering then
-            pair("网关", string.format("恢复中 · 第 %d 次", cache.gateway_reconnects or 0))
+            pair("网关", string.format("恢复中 · 第 %d 次", cache.gateway_reconnects or 0), "warn")
         elseif (cache.gateway_reconnects or 0) > 0 then
             pair("网关", string.format("正常 · 已重连 %d 次", cache.gateway_reconnects))
         end
-        if cache.recovery_error then pair("等待原因", cache.recovery_error) end
+        if cache.recovery_error then pair("等待原因", cache.recovery_error, "warn") end
     end
     local problem = lastError or cache.error
-    if problem then marks.problem = pair("异常", problem) end
+    if problem then
+        marks.problem = add({ id = "problem", label = "异常", text = problem, tone = "error",
+            actions = hasConfig and { { id = "details", label = "详情" } } or nil })
+    end
     if hasConfig or action then
         local when = not hasConfig and "未配置"
             or (lastStatusAt and "更新于 " .. os.date("%H:%M:%S", lastStatusAt) or "等待状态")
-        marks.foot = pair(when, action and action .. " ›" or "每 3 秒刷新")
+        marks.foot = pair(when, action and action .. " ›" or "每 3 秒刷新", action and "accent" or "muted")
         marks.action = action ~= nil
     end
     return rows, marks
+end
+
+-- The same rows as "label: text" lines, the hover card of a Tern without `card`.
+local function cardTitle(rows)
+    local lines = table.create(#rows)
+    for index, row in ipairs(rows) do
+        local text = string.gsub(row.text, ": ", "：")
+        lines[index] = row.label and (row.text == "" and row.label or row.label .. ": " .. text) or text
+    end
+    return table.concat(lines, "\n")
 end
 
 local function quoted(value)
@@ -1491,18 +1530,16 @@ local function rateChart()
 end
 
 -- Tern's card has no hero, pill, chart or sections for plugins; this sheet draws them
--- over the rows. It relies on the card's markup, so a markup change degrades to rows.
+-- over the native rows by position, beside the static rules of `card.css`. It relies on
+-- the card's markup, so a markup change degrades to plain rows.
 local function cardCss(marks, tone)
     local function row(index) return CARD .. " .wgc-row:nth-child(" .. index .. ")" end
     local pill = PILL[tone] or { "var(--t4)", "var(--l1)" }
     local heroColor = tone == "bad" and "var(--bad)" or (tone == "warn" and "var(--warn)" or "var(--t1)")
     local label = reviewing() and "待确认" or (not hasConfig and "未配置") or (not helperReady and "待升级") or phaseLabel()
     local css = {
-        CARD .. " .wgc-sec { border-top: 0; padding-top: 0; }",
-        CARD .. " .wgc-head::after { content: " .. quoted(label) .. "; flex: none; height: 20px; line-height: 20px;"
-            .. " padding: 0 8px 0 17px; margin-right: -2px; border-radius: 999px; font-size: 11.5px; color: var(--t2);"
+        CARD .. " .wgc-head::after { content: " .. quoted(label) .. ";"
             .. " background: radial-gradient(circle at 9px 50%, " .. pill[1] .. " 0 3px, transparent 3.5px), " .. pill[2] .. "; }",
-        CARD .. " .wgc-v { max-width: 70%; overflow: hidden; text-overflow: ellipsis; }",
         row(marks.hero) .. " { min-height: 34px; line-height: 30px; align-items: baseline; }",
         row(marks.hero) .. " .wgc-k { flex: none; font: 550 26px/30px var(--mono); letter-spacing: -0.03em; color: " .. heroColor .. "; }",
         row(marks.hero) .. " .wgc-v { margin-left: auto; font: 11.5px var(--mono); color: var(--t3); }",
@@ -1578,7 +1615,8 @@ tern.chrome.widget("turn", {
         return {
             text = barText(review),
             tone = tone == "bad" and "error" or (tone == "warn" and "warn" or "muted"),
-            title = table.concat(rows, "\n"),
+            title = cardTitle(rows),
+            card = rows,
             command = command,
             series = series,
         }
@@ -1602,12 +1640,25 @@ tern.chrome.widget("rate", {
         return {
             text = rateText(),
             tone = lastError and "error" or "muted",
-            title = table.concat(rows, "\n"),
+            title = cardTitle(rows),
+            card = rows,
             command = command,
             series = series,
         }
     end,
 })
+-- Card buttons run the same queued handlers as their palette commands.
+local CARD_ACTIONS = {
+    reconnect = commandTick(function(cx) reconnect(cx, false) end),
+    stop = commandTick(disconnect),
+    details = commandTick(status),
+}
+pcall(tern.on, "widget_action", function(ev, cx)
+    local run = type(ev) == "table" and (ev.widget == "turn" or ev.widget == "rate") and CARD_ACTIONS[ev.act]
+    if not run then return nil end
+    run(cx)
+    return true
+end)
 end
 
 -- Polling must survive hooks that were cut off: ordinary window events and a budget

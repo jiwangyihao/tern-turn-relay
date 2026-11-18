@@ -3,7 +3,7 @@
 import argparse,gzip,hashlib,io,json,os,re,shutil,stat,subprocess,tarfile,tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
-RUNTIME_FILES=('plugin.toml','window.luau','onboarding.luau','work-queue.luau','platform.luau','bootstrap-runtime.sh','bootstrap-runtime.ps1','release.json','LICENSE','THIRD_PARTY_NOTICES.txt','README.md','CHANGELOG.md','docs/agent-setup.md')
+RUNTIME_FILES=('plugin.toml','window.luau','card.css','onboarding.luau','work-queue.luau','platform.luau','bootstrap-runtime.sh','bootstrap-runtime.ps1','release.json','LICENSE','THIRD_PARTY_NOTICES.txt','README.md','CHANGELOG.md','docs/agent-setup.md')
 ASSET_TARGETS={
     'tern-turn-relay-darwin-arm64':('aarch64-apple-darwin','macos','aarch64'),
     'tern-turn-relay-darwin-x86_64':('x86_64-apple-darwin','macos','x86_64'),

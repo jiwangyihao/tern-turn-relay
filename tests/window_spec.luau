@@ -152,7 +152,7 @@ function cases.stop_bad_runtime_identity_and_timeout_preserve_hosts()
             f.time = 322001
             assert(f:tick())
         else
-            f:complete({ ok = true, runtime_ready = true, version = '0.5.21', binary = 'C:/wrong.exe' })
+            f:complete({ ok = true, runtime_ready = true, version = '0.5.22', binary = 'C:/wrong.exe' })
         end
         assert(#f.calls == 1 and f.mutations == 0 and f:view().tone == 'error')
         f:command('status')
@@ -163,7 +163,7 @@ end
 function cases.successful_prepare_still_requires_real_stop_result()
     local f = fixture('windows', true)
     f:command('disconnect')
-    f:complete({ ok = true, runtime_ready = true, version = '0.5.21', binary = 'C:/用户/data/native-runtime/0.5.21/tern-turn-relay.exe' })
+    f:complete({ ok = true, runtime_ready = true, version = '0.5.22', binary = 'C:/用户/data/native-runtime/0.5.22/tern-turn-relay.exe' })
     assert(#f.calls == 2 and f.calls[2].argv[10] == '--exec' and f.calls[2].argv[11] == 'relay' and f.calls[2].argv[12] == 'stop')
     assert(f.mutations == 0)
     f:complete({ ok = true, state = 'stopped' }) -- 缺失状态 schema，不能伪报成功。
@@ -485,6 +485,40 @@ function cases.card_sheet_styles_the_rows_it_describes()
     assert(problem and f.sheets.card:find('.wgc-row:nth-child(' .. problem .. ') .wgc-v { color: var(--bad); }', 1, true),
         'the error value is red on its own row')
     assert(f:view().tone == 'error')
+end
+
+local function cardRow(f, id)
+    for _, row in ipairs(f:view().card) do if row.id == id then return row end end
+    return nil
+end
+
+function cases.card_is_native_rows_whose_buttons_run_the_palette_handlers()
+    local f = fixture('macos', true, true)
+    f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', rtt_ms = 1200, detail = { fingerprint = 'relay-pin' } } }
+    f:complete(f:value('ready', 'tls'))
+    local card = f:view().card
+    assert(card[1].label == '1200' and card[1].text == 'TLS · server' and card[1].tone == 'warn', 'the hero row carries the health tone')
+    local relay = cardRow(f, 'relay')
+    assert(relay.tone == 'ok' and relay.actions[1].id == 'reconnect' and relay.actions[2].id == 'stop',
+        'a ready relay offers reconnect and stop')
+    local calls = #f.calls
+    assert(f.events.widget_action({ widget = 'rate', row = 'relay', act = 'stop' }, f:context()) == true)
+    f:flush()
+    assert(#f.calls == calls + 1 and f.calls[#f.calls].argv[6] == 'stop', 'the card stops the relay as the palette command does')
+    assert(f.events.widget_action({ widget = 'other', row = 'relay', act = 'stop' }, f:context()) == nil,
+        "another widget's click is left to Tern")
+    local failed = f:value('error')
+    failed.ok, failed.error = false, string.rep('故障', 150)
+    f:complete(failed)
+    local problem = cardRow(f, 'problem')
+    assert(problem.tone == 'error' and problem.actions[1].id == 'details', 'an error row offers details')
+    assert(utf8.len(problem.text) == 200 and problem.text:sub(-3) == '…', 'a long error is clipped to the row limit')
+    assert(f:view().title:find('\n异常: ', 1, true), 'a Tern without card rows still gets the lines')
+    calls = #f.calls
+    assert(f.events.widget_action({ widget = 'turn', row = 'problem', act = 'details' }, f:context()) == true)
+    f:flush()
+    assert(#f.calls == calls + 1 and f.calls[#f.calls].argv[6] == 'status', 'details queries live status')
+    assert(f.mutations == 0, 'card buttons never change Hosts by themselves')
 end
 
 function cases.lost_poll_is_rearmed_by_window_events_and_budget_resume()
