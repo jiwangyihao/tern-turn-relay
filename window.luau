@@ -45,6 +45,7 @@ local lastStatusAt = nil
 local installedCss = nil
 local paint
 local schedule
+local showDetails
 local inspectNative
 local disconnect
 local runner
@@ -1038,72 +1039,6 @@ reconnect = function(cx, automatic)
     if pending then pending.automatic = automatic end
 end
 
-local DETAILS_TITLE = "TURN 连接详情"
-local DETAILS_ABOUT = "tern-turn-relay connection diagnostics"
-
-local function detailValue(value)
-    return tostring(value == nil and "—" or value):gsub("[%c]", " "):gsub("(%p)", "\\%1")
-end
-
-local function showDetails(cx)
-    if not cx then return end
-    local rows = { "# TURN 连接详情", "", "本次查询快照；再次点击状态栏刷新。流量为本次后台实例累计值，不是速率。", "",
-        "## 连接", "", "| 项目 | 状态 |", "| --- | --- |" }
-    local function row(label, value)
-        table.insert(rows, "| " .. label .. " | " .. detailValue(value) .. " |")
-    end
-    row("后台", cache.state)
-    row("原生连接", nativeState .. (cache.state ~= "ready" and "（最近观察值；专用路由不可用）" or ""))
-    row("传输", cache.mode and string.upper(cache.mode))
-    row("入口", cache.address or alias)
-    row("当前操作", busy or (pending and pending.phase) or (statusInFlight and "查询中") or "无")
-    row("原生程序", nativeBinary)
-    row("私有数据", tern.plugin.data)
-    row("自动恢复模式", cache.resume_mode)
-    table.insert(rows, "\n## 流量与队列\n\n| 项目 | 数值 |\n| --- | --- |")
-    row("上传 / 下载", bytes(cache.bytes_up) .. " / " .. bytes(cache.bytes_down))
-    row("TURN flows / SSH TCP", tostring(cache.flows) .. " / " .. tostring(cache.ssh_connections))
-    row("恢复中的 flow", cache.recovering_flows or 0)
-    row("成功续期次数", cache.allocation_refreshes or 0)
-    row("网关恢复中", cache.gateway_recovering and "是" or "否")
-    row("网关重连尝试次数", cache.gateway_reconnects or 0)
-    row("最近网关事件", cache.gateway_failure_reason)
-    row("最近网关故障阶段", cache.gateway_failure_message)
-    row("当前恢复原因", cache.recovery_error)
-    row("排队", tostring(cache.queued_packets) .. " 包 / " .. bytes(cache.queued_bytes))
-    row("累计上行丢弃", tostring(cache.queue_dropped_packets) .. " 包 / " .. bytes(cache.queue_dropped_bytes))
-    row("累计下行丢弃", tostring(cache.downlink_dropped_packets or 0) .. " 包")
-    row("当前拥塞", cache.congested and "是（可恢复）" or "否")
-    table.insert(rows, "\n历史丢包不等于当前拥塞；SSH TCP 使用原 SSH 服务，不经 TURN。\n\n## 身份与后台\n\n| 项目 | 值 |\n| --- | --- |")
-    row("路由策略", cache.route_policy)
-    row("专用指纹", cache.relay_fingerprint)
-    row("原服务指纹", cache.target and cache.target.fingerprint)
-    row("共享 daemon", cache.daemon_socket)
-    row("后台实例", cache.service_id)
-    row("最早凭据到期（Unix 秒）", cache.credentials_expires_at)
-    row("现有连接凭据到期（Unix 秒）", cache.active_credentials_expires_at)
-    row("缓存凭据到期（Unix 秒）", cache.cached_credentials_expires_at)
-    table.insert(rows, "\n## 最近错误\n\n" .. detailValue(lastError or cache.error or "无"))
-    local markdown = table.concat(rows, "\n")
-    local ok, message = pcall(function()
-        for _, panel in ipairs(cx.canvas:list()) do
-            if panel.owner == "tern-turn-relay" and panel.about == DETAILS_ABOUT then
-                cx.canvas:set(panel.pane, { md = markdown })
-                cx.layout:focus(panel.pane)
-                return
-            end
-        end
-        local pane, err = cx.canvas:open({ title = DETAILS_TITLE, about = DETAILS_ABOUT,
-            md = markdown, how = "tab" })
-        if not pane then error(err or "Cannot open TURN details panel") end
-    end)
-    if not ok then
-        lastError = tostring(message)
-        refresh()
-        cx:toast("error", "无法打开 TURN 详情", "当前 Host 的详情面板不可用")
-    end
-end
-
 local function status(cx)
     cancelStartup()
     if not hasConfig then report(cx, "尚未配置；请显式打开 TURN Settings。查询状态不会下载运行时。"); showDetails(cx); return end
@@ -1243,7 +1178,7 @@ end
 local BACKEND = { ready = "就绪", starting = "启动中", stopped = "已停止", error = "不可用" }
 local BACKEND_TONE = { ready = "ok", starting = "warn", stopped = "muted", error = "error" }
 local HEALTH_TONE = { ok = "ok", warn = "warn", bad = "error" }
--- Both widgets (latency and throughput) share one card.
+-- Shared chrome; the two cards reserve the same row for their own trend.
 local CARD = '.kit-popover.wgc[data-widget^="tern-turn-relay/"]'
 local CARD_TEXT_MAX = 200
 -- Status pill in the card head, as Memory's: dot color, then tint.
@@ -1385,20 +1320,21 @@ local function clip(value, max)
     return string.sub(text, 1, utf8.offset(text, max) - 1) .. "…"
 end
 
--- The relay row's buttons: re-attach Tern's session to a ready relay, or stop a relay
+-- The card's operations sit in its foot, as Tern's own cards place theirs, never on a
+-- state row: details, re-attaching Tern's session to a ready relay, then stopping a relay
 -- that runs or is due to resume. None while an operation or review is in progress.
-local function relayActions(review)
+local function cardActions(review)
     if review or not hasConfig or not helperReady or busy or pending then return nil end
-    local actions = {}
+    local actions = { { id = "details", label = "详情" } }
     if cache.state == "ready" then table.insert(actions, { id = "reconnect", label = "重连" }) end
     if cache.state ~= "stopped" or cache.resume_mode then table.insert(actions, { id = "stop", label = "停止" }) end
-    return #actions > 0 and actions or nil
+    return actions
 end
 
 -- The card is native `card` rows: label, text, tone and buttons. Tern has no hero, pill,
 -- chart or sections for plugin cards yet, so `cardCss` draws them over these rows by
 -- position; marks name those rows. Drop that drawing once Tern offers them.
-local function cardRows(review, action)
+local function cardRows(review, action, throughput)
     local rows, marks = {}, {}
     local function add(row)
         row.text = clip(row.text, CARD_TEXT_MAX)
@@ -1411,23 +1347,28 @@ local function cardRows(review, action)
     local configured = hasConfig and helperReady and not review
     if configured then
         local name = cache.target and cache.target.name
-        marks.hero = pair(heroText(review), (cache.mode and string.upper(cache.mode) or "TURN") .. (name and " · " .. name or ""), heroTone)
+        local mode = (cache.mode and string.upper(cache.mode) or "TURN") .. (name and " · " .. name or "")
+        local measuring = cache.state == "ready" or cache.state == "starting"
+        local currentRate = measuring and rate.down ~= nil
+        if throughput then
+            local reading = currentRate and ("↓ " .. speed(rate.down)) or (measuring and "等待采样" or phaseLabel())
+            marks.hero = pair(reading, mode, heroTone)
+            marks.trend = #rate.samples > 0 and pair(span(os.time() - rate.samples[1].t),
+                "峰值 ↓" .. speed(rate.peakDown) .. " · ↑" .. speed(rate.peakUp), "muted")
+                or pair("采样", "等待速率读数", "muted")
+            pair("当前上传", currentRate and speed(rate.up) or "—")
+        else
+            marks.hero = pair(heroText(review), mode, heroTone)
+            marks.trend = #rtt.samples > 0 and pair(span(os.time() - rtt.samples[1].t),
+                string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max), "muted")
+                or pair("采样", "等待延迟读数", "muted")
+            pair("吞吐", currentRate and ("↓" .. speed(rate.down) .. " · ↑" .. speed(rate.up)) or "—")
+        end
     else
         marks.hero = pair(heroText(review), "", heroTone)
     end
-    if #rtt.samples > 0 then
-        marks.graph = pair(span(os.time() - rtt.samples[1].t), string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max), "muted")
-    end
-    if hasConfig and not review and (rate.down or #rate.samples > 0) then
-        marks.rate = pair("吞吐", rate.down and ("↓" .. speed(rate.down) .. " · ↑" .. speed(rate.up)) or "—")
-        if #rate.samples > 0 then
-            marks.rateGraph = pair(span(os.time() - rate.samples[1].t),
-                "峰值 ↓" .. speed(rate.peakDown) .. " · ↑" .. speed(rate.peakUp), "muted")
-        end
-    end
     if hasConfig and not review then
-        marks.section = add({ id = "relay", label = "中继", text = BACKEND[cache.state] or cache.state,
-            tone = BACKEND_TONE[cache.state], actions = relayActions(review) })
+        marks.section = pair("中继", BACKEND[cache.state] or cache.state, BACKEND_TONE[cache.state])
         pair("连接", string.format("TURN %d · SSH %d", cache.flows, cache.ssh_connections))
         pair("流量", "↑" .. bytes(cache.bytes_up) .. " ↓" .. bytes(cache.bytes_down))
         local endpoint = cache.address and cache.address:match("@(.+)$")
@@ -1443,15 +1384,18 @@ local function cardRows(review, action)
         if cache.recovery_error then pair("等待原因", cache.recovery_error, "warn") end
     end
     local problem = lastError or cache.error
-    if problem then
-        marks.problem = add({ id = "problem", label = "异常", text = problem, tone = "error",
-            actions = hasConfig and { { id = "details", label = "详情" } } or nil })
-    end
+    if problem then marks.problem = pair("异常", problem, "error") end
     if hasConfig or action then
         local when = not hasConfig and "未配置"
             or (lastStatusAt and "更新于 " .. os.date("%H:%M:%S", lastStatusAt) or "等待状态")
-        marks.foot = pair(when, action and action .. " ›" or "每 3 秒刷新", action and "accent" or "muted")
-        marks.action = action ~= nil
+        local actions = cardActions(review)
+        if actions then
+            marks.foot = add({ id = "actions", label = when, text = "", tone = "muted", actions = actions })
+            marks.stop = actions[#actions].id == "stop"
+        else
+            marks.foot = pair(when, action and action .. " ›" or "每 3 秒刷新", action and "accent" or "muted")
+            marks.action = action ~= nil
+        end
     end
     return rows, marks
 end
@@ -1533,7 +1477,10 @@ end
 -- over the native rows by position, beside the static rules of `card.css`. It relies on
 -- the card's markup, so a markup change degrades to plain rows.
 local function cardCss(marks, tone)
-    local function row(index) return CARD .. " .wgc-row:nth-child(" .. index .. ")" end
+    local function row(index, widget)
+        local scope = widget and ('.kit-popover.wgc[data-widget="tern-turn-relay/' .. widget .. '"]') or CARD
+        return scope .. " .wgc-row:nth-child(" .. index .. ")"
+    end
     local pill = PILL[tone] or { "var(--t4)", "var(--l1)" }
     local heroColor = tone == "bad" and "var(--bad)" or (tone == "warn" and "var(--warn)" or "var(--t1)")
     local label = reviewing() and "待确认" or (not hasConfig and "未配置") or (not helperReady and "待升级") or phaseLabel()
@@ -1545,30 +1492,29 @@ local function cardCss(marks, tone)
         row(marks.hero) .. " .wgc-v { margin-left: auto; font: 11.5px var(--mono); color: var(--t3); }",
     }
     if connectedRtt() then
-        table.insert(css, row(marks.hero) .. ' .wgc-k::after { content: "ms"; margin-left: 4px; font: 400 13px var(--sans);'
+        table.insert(css, row(marks.hero, "turn") .. ' .wgc-k::after { content: "ms"; margin-left: 4px; font: 400 13px var(--sans);'
             .. " letter-spacing: 0; color: var(--t3); }")
     end
-    local function chart(index, svg, label)
-        table.insert(css, row(index) .. " { position: relative; padding-top: 62px; min-height: 18px; line-height: 18px;"
+    local function chart(selector, svg, label)
+        table.insert(css, selector .. " { position: relative; padding-top: 62px; min-height: 18px; line-height: 18px;"
             .. ' background: url("data:image/svg+xml;utf8,' .. svg .. '") 0 2px / 100% ' .. CHART_H .. "px no-repeat; }")
-        table.insert(css, row(index) .. "::before { content: " .. quoted(label) .. "; position: absolute; top: 0; right: 0;"
+        table.insert(css, selector .. "::before { content: " .. quoted(label) .. "; position: absolute; top: 0; right: 0;"
             .. " font: 10.5px/12px var(--mono); color: var(--t4); }")
-        table.insert(css, row(index) .. " .wgc-k, " .. row(index) .. " .wgc-v { font-size: 11.5px; color: var(--t3); }")
-        table.insert(css, row(index) .. " .wgc-v { max-width: none; }")
+        table.insert(css, selector .. " .wgc-k, " .. selector .. " .wgc-v { font-size: 11.5px; color: var(--t3); }")
+        table.insert(css, selector .. " .wgc-v { max-width: none; }")
     end
     local function section(index)
         table.insert(css, row(index) .. " { margin: 8px -12px 2px; padding: 8px 12px 0; border-top: 1px solid var(--l1); }")
         table.insert(css, row(index) .. " .wgc-k { font-weight: 550; color: var(--t2); }")
     end
-    if marks.graph then chart(marks.graph, rttChart()) end
-    if marks.rate then
-        section(marks.rate)
-        table.insert(css, row(marks.rate) .. " .wgc-v { font: 11.5px var(--mono); color: var(--t1); }")
+    if marks.trend then
+        if #rtt.samples > 0 then chart(row(marks.trend, "turn"), rttChart()) end
+        if #rate.samples > 0 then chart(row(marks.trend, "rate"), rateChart()) end
     end
-    if marks.rateGraph then chart(marks.rateGraph, rateChart()) end
     if marks.section then
         section(marks.section)
-        table.insert(css, row(marks.section) .. " .wgc-v { font: 11.5px var(--sans); color: var(--t3); }")
+        -- The value keeps its native tone color (ready green, starting amber, unavailable red).
+        table.insert(css, row(marks.section) .. " .wgc-v { font: 11.5px var(--sans); }")
     end
     if marks.problem then table.insert(css, row(marks.problem) .. " .wgc-v { color: var(--bad); }") end
     if marks.foot then
@@ -1577,9 +1523,246 @@ local function cardCss(marks, tone)
         table.insert(css, row(marks.foot) .. " .wgc-k { font: 11.5px var(--mono); color: var(--t3); }")
         table.insert(css, row(marks.foot) .. " .wgc-v { font: 12px var(--sans); color: "
             .. (marks.action and "var(--accent)" or "var(--t3)") .. "; }")
+        -- Stop interrupts every window: red, and always the foot's last button when present.
+        if marks.stop then table.insert(css, row(marks.foot) .. " .wgc-plugin-act:last-child { color: var(--bad); }") end
     end
     return table.concat(css, "\n")
 end
+
+-- The canvas is a queried snapshot; only the status bar samples in the background.
+local DETAILS_TITLE = "TURN 连接详情"
+local DETAILS_ABOUT = "tern-turn-relay connection diagnostics"
+local VIEW_TONE = { ok = "success", warn = "warning", bad = "error" }
+local NATIVE_LABEL = { connected = "已连接", connecting = "连接中", reconnecting = "重连中", stalled = "卡住",
+    failed = "已放弃", disconnected = "未连接" }
+local BUSY_LABEL = { start = "启动后台", resume = "恢复后台", stop = "停止中" }
+
+local function viewNode(kind, props, children) return { k = kind, p = props, c = children } end
+
+-- Spans of one line: a kv value or a text node's runs. An absent value is a dim dash.
+local function fact(value, style)
+    if value == nil then return { { t = "—", s = "dim" } } end
+    return { { t = (tostring(value):gsub("[%c]", " ")), s = style } }
+end
+
+local function facts(items)
+    local list = table.create(#items)
+    for index, item in ipairs(items) do list[index] = { k = item[1], v = item[2] } end
+    return viewNode("kv", { items = list })
+end
+
+local function foldable(key, head, children, collapsed)
+    return viewNode("section", { key = key, head = head, collapsible = true, collapsed = collapsed == true }, children)
+end
+
+local function clockOf(seconds) return os.date("%H:%M:%S", seconds) end
+local function dateOf(seconds) return seconds and os.date("%Y-%m-%d %H:%M", seconds) or nil end
+
+local function detailsHead(name, meta, badge, tone)
+    return viewNode("row", { key = "head", role = "turn-relay-header", justify = "between", align = "center", wrap = true, gap = "md" }, {
+        viewNode("col", { gap = "xs" }, {
+            viewNode("text", { role = "turn-relay-kicker", text = "TURN Relay  /  连接概览" }),
+            viewNode("row", { align = "center", wrap = true, gap = "md" }, {
+                viewNode("text", { role = "turn-relay-host", text = name }),
+                viewNode("badge", { text = badge, tone = tone }),
+            }),
+        }),
+        viewNode("row", { gap = "md", align = "center", wrap = true }, {
+            viewNode("text", { spans = fact(meta, "muted") }),
+            viewNode("button", { key = "refresh", text = "刷新", icon = "repeat", variant = "quiet", actions = { click = "refresh" } }),
+        }),
+    })
+end
+
+local function errorCard()
+    local problem = lastError or cache.error
+    if not problem then return nil end
+    return viewNode("card", { key = "error", tone = "error", head = "最近错误" }, {
+        viewNode("text", { spans = fact(problem) }),
+    })
+end
+
+local function sampleLabels(samples)
+    local labels = table.create(#samples)
+    for index, sample in ipairs(samples) do labels[index] = clockOf(sample.t) end
+    return labels
+end
+
+local function latencyChart()
+    if #rtt.samples == 0 then
+        return viewNode("empty", { key = "chart", variant = "inline", icon = "", text = "暂无样本：Host 连接后每次轮询记录一次。" })
+    end
+    local values = table.create(#rtt.samples)
+    for index, sample in ipairs(rtt.samples) do values[index] = sample.ms end
+    return viewNode("chart", { key = "chart", kind = "line", unit = "ms", size = "sm", last = false, series = values,
+        labels = sampleLabels(rtt.samples), marks = { { value = rtt.median, title = "中位延迟" } } })
+end
+
+-- Download and upload on one scale, in the unit their peak reads best in.
+local function throughputChart()
+    if #rate.samples == 0 then
+        return viewNode("empty", { key = "chart", variant = "inline", icon = "", text = "暂无样本：有 TURN 流量后开始记录。" })
+    end
+    local peak, unit = math.max(rate.peakDown, rate.peakUp), 1
+    while peak >= 1024 and unit < #RATE_UNITS do peak /= 1024; unit += 1 end
+    local divisor = 1024 ^ (unit - 1)
+    local down, up = table.create(#rate.samples), table.create(#rate.samples)
+    for index, sample in ipairs(rate.samples) do
+        down[index] = sample.down / divisor
+        up[index] = sample.up / divisor
+    end
+    return viewNode("chart", { key = "chart", kind = "line", size = "sm", unit = RATE_UNITS[unit] .. "/s", aria = "下载与上传速率",
+        labels = sampleLabels(rate.samples), series = {
+            { label = "下载", token = "accent", values = down }, { label = "上传", token = "pending", values = up },
+        } })
+end
+
+local function reading(value, caption, tone, series)
+    local number, unit = (value or ""):match("^(%S+) (.+)$")
+    local runs = number and { { t = number, s = tone }, { t = " " .. unit, s = "muted" } } or fact(value, tone)
+    local legend = series and { { t = "● ", s = series }, { t = caption, s = "muted" } } or fact(caption, "muted")
+    return viewNode("col", { gap = "xs" }, {
+        viewNode("text", { role = "turn-relay-reading", spans = runs }),
+        viewNode("text", { spans = legend }),
+    })
+end
+
+local function meter(key, title, samples, readings, chart)
+    local first, last = samples[1], samples[#samples]
+    local children = {
+        viewNode("row", { justify = "between", align = "center", wrap = true, gap = "sm" }, {
+            viewNode("text", { spans = fact(title, "strong") }),
+            viewNode("text", { role = "turn-relay-period", text = first and (#samples .. " 个样本") or "暂无样本" }),
+        }),
+        viewNode("row", { gap = "lg", wrap = true }, readings),
+        chart,
+    }
+    if first then
+        table.insert(children, viewNode("row", { role = "turn-relay-times", justify = "between" }, {
+            viewNode("text", { text = clockOf(first.t) }),
+            first ~= last and viewNode("text", { text = clockOf(last.t) }) or nil,
+        }))
+    end
+    return viewNode("col", { key = key, role = "turn-relay-meter", gap = "md" }, children)
+end
+
+local function detailsView()
+    local page = {}
+    local function add(child) if child then table.insert(page, child) end end
+    if not hasConfig then
+        add(detailsHead("连接设置", "尚无状态快照", "未配置", "muted"))
+        add(errorCard())
+        add(viewNode("empty", { key = "setup", icon = "broadcast", title = "尚未配置 TURN",
+            text = "填写服务器与 Cloudflare Key 后才会连接；查询状态不会下载运行时。" }, {
+            viewNode("button", { key = "open", text = "打开 TURN Settings…", variant = "primary", actions = { click = "setup" } }),
+        }))
+        return viewNode("col", { role = "turn-relay-overview", gap = "lg" }, page)
+    end
+
+    local meta = { lastStatusAt and ("上次读数 " .. clockOf(lastStatusAt)) or "等待首次读数" }
+    if cache.mode then table.insert(meta, 1, string.upper(cache.mode)) end
+    local tone = VIEW_TONE[health()] or ((busy or pending or cache.state == "starting") and "accent" or "muted")
+    add(detailsHead((cache.target and cache.target.name) or "TURN", table.concat(meta, " · "), phaseLabel(), tone))
+
+    add(errorCard())
+    local ms = connectedRtt()
+    local measuring = cache.state == "ready" or cache.state == "starting"
+    local rates = measuring and rate.down ~= nil
+    add(viewNode("row", { key = "meters", role = "turn-relay-meters", wrap = true, align = "stretch", gap = "md" }, {
+        meter("rtt", "往返延迟", rtt.samples, {
+            reading(ms and string.format("%.0f ms", ms),
+                rtt.median and string.format("中位 %.0f · 峰值 %.0f ms", rtt.median, rtt.max) or "等待 Host 读数",
+                ms and ms >= RTT_SLOW_MS and "warning" or nil),
+        }, latencyChart()),
+        meter("rate", "传输速率", rate.samples, {
+            reading(rates and speed(rate.down) or nil, "下载", nil, "accent"),
+            reading(rates and speed(rate.up) or nil, "上传", nil, "pending"),
+        }, throughputChart()),
+    }))
+
+    add(viewNode("text", { key = "diagnostics", role = "turn-relay-kicker", text = "诊断明细" }))
+
+    local observed = cache.state ~= "ready" and "（最近观察值）" or ""
+    local sessions = string.format("TURN %d · SSH %d", cache.flows, cache.ssh_connections)
+    add(foldable("link", { "连接信息", { t = "   " .. sessions .. observed, s = "muted" } }, { facts({
+        { "后台", fact(BACKEND[cache.state] or cache.state) },
+        { "Tern 连接", fact((NATIVE_LABEL[nativeState] or nativeState) .. observed) },
+        { "传输", fact(cache.mode and string.upper(cache.mode)) },
+        { "入口", fact(cache.address or alias, "mono") },
+        { "本次累计流量", fact("↓ " .. bytes(cache.bytes_down) .. "  ↑ " .. bytes(cache.bytes_up), "mono") },
+        { "当前操作", fact(busy and (BUSY_LABEL[busy] or busy) or (pending and pending.phase) or "无") },
+        { "自动恢复模式", fact(cache.resume_mode and string.upper(cache.resume_mode)) },
+    }) }, true))
+
+    local queue = {
+        { "排队", fact(string.format("%d 包 / %s", cache.queued_packets, bytes(cache.queued_bytes)), "mono") },
+        { "当前拥塞", cache.congested and fact("是（可恢复）", "warning") or fact("否") },
+        { "上行丢弃（累计）", fact(string.format("%d 包 / %s", cache.queue_dropped_packets, bytes(cache.queue_dropped_bytes)), "mono") },
+        { "下行丢弃（累计）", fact(string.format("%d 包", cache.downlink_dropped_packets or 0), "mono") },
+        { "恢复中的 flow", fact(cache.recovering_flows or 0, "mono") },
+        { "续期成功", fact(string.format("%d 次", cache.allocation_refreshes or 0), "mono") },
+        { "网关恢复中", cache.gateway_recovering and fact("是", "warning") or fact("否") },
+        { "网关重连尝试", fact(string.format("%d 次", cache.gateway_reconnects or 0), "mono") },
+    }
+    if cache.gateway_failure_reason then table.insert(queue, { "最近网关事件", fact(cache.gateway_failure_reason, "mono") }) end
+    if cache.gateway_failure_message then table.insert(queue, { "最近网关故障阶段", fact(cache.gateway_failure_message) }) end
+    if cache.recovery_error then table.insert(queue, { "当前恢复原因", fact(cache.recovery_error) }) end
+    local attention = measuring and (cache.congested or cache.gateway_recovering or (cache.recovering_flows or 0) > 0 or cache.queued_packets > 0)
+    local summary = not measuring and "无实时读数" or (cache.gateway_recovering and "网关恢复中") or (cache.congested and "当前拥塞")
+        or ((cache.recovering_flows or 0) > 0 and "连接恢复中") or (cache.queued_packets > 0 and ("排队 " .. cache.queued_packets .. " 包"))
+        or "无排队"
+    add(foldable(attention and "queue-alert" or "queue", { "队列与恢复", { t = "   " .. summary, s = attention and "warning" or "muted" } }, {
+        facts(queue),
+        viewNode("text", { spans = fact("累计丢包不等于当前拥塞；SSH TCP 使用原 SSH 服务，不经 TURN。", "muted") }),
+    }, not attention))
+
+    add(foldable("identity", { "身份与后台", { t = "   指纹、凭据与运行路径", s = "muted" } }, { facts({
+        { "路由策略", fact(cache.route_policy, "mono") },
+        { "专用指纹", fact(cache.relay_fingerprint, "mono") },
+        { "原服务指纹", fact(cache.target and cache.target.fingerprint, "mono") },
+        { "后台实例", fact(cache.service_id, "mono") },
+        { "共享 daemon", fact(cache.daemon_socket, "mono") },
+        { "最早凭据到期", fact(dateOf(cache.credentials_expires_at), "mono") },
+        { "现有连接凭据到期", fact(dateOf(cache.active_credentials_expires_at), "mono") },
+        { "缓存凭据到期", fact(dateOf(cache.cached_credentials_expires_at), "mono") },
+        { "原生程序", fact(nativeBinary, "mono") },
+        { "私有数据", fact(tern.plugin.data, "mono") },
+    }) }, true))
+    return viewNode("col", { role = "turn-relay-overview", gap = "lg" }, page)
+end
+
+showDetails = function(cx)
+    if not cx then return end
+    local view = detailsView()
+    local ok, message = pcall(function()
+        for _, panel in ipairs(cx.canvas:list()) do
+            if panel.owner == "tern-turn-relay" and panel.about == DETAILS_ABOUT then
+                cx.canvas:set(panel.pane, { view = view })
+                cx.layout:focus(panel.pane)
+                return
+            end
+        end
+        local pane, err = cx.canvas:open({ title = DETAILS_TITLE, about = DETAILS_ABOUT, view = view, how = "tab" })
+        if not pane then error(err or "Cannot open TURN details panel") end
+    end)
+    if not ok then
+        lastError = tostring(message)
+        refresh()
+        cx:toast("error", "无法打开 TURN 详情", "当前 Host 的详情面板不可用")
+    end
+end
+
+-- The page's buttons: Refresh re-queries like Status; Setup opens TURN Settings.
+local DETAILS_ACTIONS = {
+    refresh = commandTick(status),
+    setup = commandTick(function(cx) onboarding.open(cx) end),
+}
+pcall(tern.on, "canvas_action", function(ev, cx)
+    local run = type(ev) == "table" and ev.about == DETAILS_ABOUT and DETAILS_ACTIONS[ev.act]
+    if not run then return nil end
+    run(cx)
+    return true
+end)
 
 -- Card rows and their sheet come from the same state; the sheet is replaced only when it changed.
 paint = function()
@@ -1630,7 +1813,7 @@ tern.chrome.widget("rate", {
     render = function()
         local review = reviewing()
         local command, action = clickAction(review)
-        local rows = cardRows(review, action)
+        local rows = cardRows(review, action, true)
         local series = nil
         if #rate.samples > 0 then
             local scale = rateScale(rate.peakDown)

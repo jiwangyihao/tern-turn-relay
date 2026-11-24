@@ -1,6 +1,13 @@
 local install = require('../window')
 local cases = {}
 
+-- Every string a view holds, so assertions read what the details page says.
+local function viewText(node, out)
+    if type(node) == 'string' then table.insert(out, node)
+    elseif type(node) == 'table' then for _, value in pairs(node) do viewText(value, out) end end
+    return out
+end
+
 local function fixture(os, configured, installed, kv)
     local f = { calls = {}, commands = {}, timers = {}, time = 0, mutations = 0, toasts = {}, details = '', hosts = {}, reads = {}, kv = kv or {}, widgets = {}, events = {}, sheets = {} }
     f.config = { schema = 4, ssh_destination = 'server', listen_port = 18377,
@@ -62,7 +69,7 @@ local function fixture(os, configured, installed, kv)
         return {
             toast = function(_, _, title, detail) table.insert(self.toasts, title .. ' ' .. tostring(detail)) end,
             hosts = { list = function() return self.hosts end, current = function() return { kind = 'local', id = 'local' } end, add = mutate, disconnect = mutate, trust = mutate, switch = mutate },
-            canvas = { list = function() return {} end, open = function(_, options) self.details = options.md; return 'pane' end },
+            canvas = { list = function() return {} end, open = function(_, options) self.details = table.concat(viewText(options.view, {}), '\n'); return 'pane' end },
         }
     end
     function f:tick()
@@ -267,7 +274,7 @@ function cases.periodic_status_is_live_deduplicated_and_failure_invalidates_read
     assert(#f.calls == 2, '并发 Status 不得重复查询')
     f:complete({ ok = false, error = 'control unavailable' }, 1)
     assert(f:view().text:find('不可用') and not f:view().text:find('已连接'))
-    assert(f.details:find('error', 1, true), '等待中的详情订阅应显示实时失败结果')
+    assert(f.details:find('Invalid helper status JSON', 1, true), '等待中的详情订阅应显示实时失败结果')
     assert(f.mutations == 0)
     for _, path in ipairs(f.reads) do assert(not path:find('status.json', 1, true)) end
     f:command('status'); f:complete(f:value('ready'))
@@ -487,38 +494,63 @@ function cases.card_sheet_styles_the_rows_it_describes()
     assert(f:view().tone == 'error')
 end
 
-local function cardRow(f, id)
-    for _, row in ipairs(f:view().card) do if row.id == id then return row end end
+local function cardRow(f, field, value)
+    for _, row in ipairs(f:view().card) do if row[field] == value then return row end end
     return nil
 end
 
-function cases.card_is_native_rows_whose_buttons_run_the_palette_handlers()
+function cases.card_states_on_rows_and_operations_in_the_foot()
     local f = fixture('macos', true, true)
     f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', rtt_ms = 1200, detail = { fingerprint = 'relay-pin' } } }
     f:complete(f:value('ready', 'tls'))
     local card = f:view().card
     assert(card[1].label == '1200' and card[1].text == 'TLS · server' and card[1].tone == 'warn', 'the hero row carries the health tone')
-    local relay = cardRow(f, 'relay')
-    assert(relay.tone == 'ok' and relay.actions[1].id == 'reconnect' and relay.actions[2].id == 'stop',
-        'a ready relay offers reconnect and stop')
+    local relay = cardRow(f, 'label', '中继')
+    assert(relay.tone == 'ok' and relay.actions == nil, 'a state row carries no buttons')
+    local foot = card[#card]
+    assert(foot.id == 'actions' and foot.text == '' and foot.label:find('^更新于 '), 'the foot holds the operations beside the update time')
+    assert(foot.actions[1].id == 'details' and foot.actions[2].id == 'reconnect' and foot.actions[3].id == 'stop',
+        'inspect, re-attach, then the destructive stop last')
+    assert(f.sheets.card:find(':nth-child(' .. #card .. ') .wgc-plugin-act:last-child { color: var(--bad); }', 1, true),
+        'stop is red in the foot')
     local calls = #f.calls
-    assert(f.events.widget_action({ widget = 'rate', row = 'relay', act = 'stop' }, f:context()) == true)
+    assert(f.events.widget_action({ widget = 'rate', row = 'actions', act = 'stop' }, f:context()) == true)
     f:flush()
     assert(#f.calls == calls + 1 and f.calls[#f.calls].argv[6] == 'stop', 'the card stops the relay as the palette command does')
-    assert(f.events.widget_action({ widget = 'other', row = 'relay', act = 'stop' }, f:context()) == nil,
+    assert(f.events.widget_action({ widget = 'other', row = 'actions', act = 'stop' }, f:context()) == nil,
         "another widget's click is left to Tern")
     local failed = f:value('error')
     failed.ok, failed.error = false, string.rep('故障', 150)
     f:complete(failed)
-    local problem = cardRow(f, 'problem')
-    assert(problem.tone == 'error' and problem.actions[1].id == 'details', 'an error row offers details')
+    local problem = cardRow(f, 'label', '异常')
+    assert(problem.tone == 'error' and problem.actions == nil, 'an error row is a state row')
     assert(utf8.len(problem.text) == 200 and problem.text:sub(-3) == '…', 'a long error is clipped to the row limit')
     assert(f:view().title:find('\n异常: ', 1, true), 'a Tern without card rows still gets the lines')
     calls = #f.calls
-    assert(f.events.widget_action({ widget = 'turn', row = 'problem', act = 'details' }, f:context()) == true)
+    assert(f.events.widget_action({ widget = 'turn', row = 'actions', act = 'details' }, f:context()) == true)
     f:flush()
     assert(#f.calls == calls + 1 and f.calls[#f.calls].argv[6] == 'status', 'details queries live status')
+    f:complete(f:value('stopped'))
+    foot = f:view().card[#f:view().card]
+    assert(#foot.actions == 1 and foot.actions[1].id == 'details', 'a stopped relay offers only details')
+    assert(not f.sheets.card:find('.wgc-plugin-act:last-child', 1, true), 'without stop no button turns red')
     assert(f.mutations == 0, 'card buttons never change Hosts by themselves')
+end
+
+function cases.details_page_refresh_requeries_status()
+    local f = fixture('macos', true, true)
+    f.hosts = { { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = 'connected', detail = { fingerprint = 'relay-pin' } } }
+    f:complete(f:value('ready', 'tls'))
+    local calls = #f.calls
+    local click = { pane = 1, node = 'head.end.refresh', act = 'refresh', owner = 'tern-turn-relay', about = 'tern-turn-relay connection diagnostics' }
+    assert(f.events.canvas_action(click, f:context()) == true)
+    f:flush()
+    assert(#f.calls == calls + 1 and f.calls[#f.calls].argv[6] == 'status', 'Refresh re-queries live status')
+    f:complete(f:value('stopped'))
+    assert(f.details:find('已停止', 1, true), 'the page redraws with the fresh state')
+    assert(f.events.canvas_action({ pane = 2, node = 'x', act = 'refresh', owner = 'tern-turn-relay', about = 'TURN review' }, f:context()) == nil,
+        "another canvas's click is left to its owner")
+    assert(f.mutations == 0)
 end
 
 function cases.lost_poll_is_rearmed_by_window_events_and_budget_resume()
@@ -575,7 +607,10 @@ function cases.throughput_is_counter_delta_and_restarts_after_a_reset()
     assert(f.widgets.rate.render(nil).text == '↓— ↑—', 'a counter that went back is a new baseline, not a negative rate')
     poll(1024 + 3 * 512 * 1024, 0)
     assert(f.widgets.rate.render(nil).text == '↓512K ↑0B')
-    assert(f:view().title:find('峰值 ↓1.0 MiB/s · ↑1.0 KiB/s', 1, true), 'the peak spans the whole history')
+    local rateCard = f.widgets.rate.render(nil)
+    assert(rateCard.card[1].label == '↓ 512.0 KiB/s' and rateCard.card[3].text == '0 B/s', 'the throughput card leads with its own rates')
+    assert(rateCard.title:find('峰值 ↓1.0 MiB/s · ↑1.0 KiB/s', 1, true) and not f:view().title:find('峰值 ↓', 1, true),
+        'only the throughput card shows the throughput history')
     assert(f.sheets.card:find('content: "1 MiB/s"', 1, true), 'the throughput chart tops at the rounded-up peak')
 end
 
