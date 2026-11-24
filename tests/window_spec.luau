@@ -159,7 +159,7 @@ function cases.stop_bad_runtime_identity_and_timeout_preserve_hosts()
             f.time = 322001
             assert(f:tick())
         else
-            f:complete({ ok = true, runtime_ready = true, version = '0.5.22', binary = 'C:/wrong.exe' })
+            f:complete({ ok = true, runtime_ready = true, version = '0.5.23', binary = 'C:/wrong.exe' })
         end
         assert(#f.calls == 1 and f.mutations == 0 and f:view().tone == 'error')
         f:command('status')
@@ -170,7 +170,7 @@ end
 function cases.successful_prepare_still_requires_real_stop_result()
     local f = fixture('windows', true)
     f:command('disconnect')
-    f:complete({ ok = true, runtime_ready = true, version = '0.5.22', binary = 'C:/用户/data/native-runtime/0.5.22/tern-turn-relay.exe' })
+    f:complete({ ok = true, runtime_ready = true, version = '0.5.23', binary = 'C:/用户/data/native-runtime/0.5.23/tern-turn-relay.exe' })
     assert(#f.calls == 2 and f.calls[2].argv[10] == '--exec' and f.calls[2].argv[11] == 'relay' and f.calls[2].argv[12] == 'stop')
     assert(f.mutations == 0)
     f:complete({ ok = true, state = 'stopped' }) -- 缺失状态 schema，不能伪报成功。
