@@ -1,26 +1,26 @@
 {
   "schema": 1,
-  "version": "0.5.22",
+  "version": "0.5.23",
   "assets": {
     "tern-turn-relay-darwin-arm64": {
-      "sha256": "db1708abe8fe847868a101574b5a196877cf1b344bc19eca161a7894a9674eef",
+      "sha256": "5d50358e0152d635299ead0975fc7fa4224f10d05470012fcb6950e731c1ef3f",
       "size": 4158816
     },
     "tern-turn-relay-darwin-x86_64": {
-      "sha256": "9f3e1ac60990fa6c17f3e586aa88e9f03d32b324e82174d8f9ef4cf666097974",
-      "size": 4429864
+      "sha256": "1658de062ca41e41ff53459d0d8e2da8c0c43594421ea699f2de74232ca6be93",
+      "size": 4429856
     },
     "tern-turn-relay-linux-arm64": {
-      "sha256": "8107aa42ac9fecb98e409fe92edd2f206b4db35a7115d625ceabcd40c43bccb0",
+      "sha256": "632f159ddbac074fe32edfd6c35af03abafdec89bfdddc6d6f2747a24bc94a9b",
       "size": 4462240
     },
     "tern-turn-relay-linux-x86_64": {
-      "sha256": "96def24a18b0debbe55d7faad597152bea3128d8b18334b2448e7a1848fdd036",
+      "sha256": "ff34fbb1b0a9d834bc1ba527ffee042631fd698774ecc653fd6387060406fe98",
       "size": 5167312
     },
     "tern-turn-relay-windows-x86_64.exe": {
-      "sha256": "081b8621b9a8e75b4be8d0c2678e60a0e91692c1e4cd618e96106861b3f0cc95",
-      "size": 5456896
+      "sha256": "4d622ee073ad08dbc50a62b24e115210b42c3d4961eb0deddc643a44cb587908",
+      "size": 5451776
     }
   }
 }
