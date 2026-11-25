@@ -6,8 +6,9 @@ local MAX_RECEIPT = 4096
 local failures = {
     ['unsupported-invite'] = '仅支持 Tern 配对邀请链接。',
     ['no-invite'] = '图片中没有找到 Tern 配对邀请。',
-    ['invalid-image'] = '无法读取图片，请选择有效的 PNG 或 JPEG。',
-    ['image-too-large'] = '图片过大，请选择较小的 PNG 或 JPEG。',
+    ['invalid-image'] = '图片损坏或格式不支持，无法识别二维码。',
+    ['no-clipboard-image'] = '剪贴板中没有可读取的图片。请先复制二维码图片或截图。',
+    ['image-too-large'] = '图片过大，请裁剪二维码区域后再试。',
     ['delivery-failed'] = '无法将邀请交给本机 Tern。',
     ['import-failed'] = '无法完成导入，请检查本机插件运行时。',
     ['unsupported-platform'] = '仅支持 macOS 桌面 Tern。',
@@ -105,7 +106,7 @@ function M.new(tern, platform)
         end)
     end
     local function chooseSource(source, cx)
-        if source ~= 'text' and source ~= 'image' then notify(cx, 'import-failed'); return end
+        if source ~= 'text' and source ~= 'image' and source ~= 'clipboard' then notify(cx, 'import-failed'); return end
         -- Existence is only a hint for offering preparation. --exec verifies the
         -- binary on every call and never repairs or downloads it implicitly.
         local ok, exists = pcall(tern.fs.exists, platform.binary)
@@ -128,6 +129,7 @@ function M.new(tern, platform)
             if active and current(active, cx) then cx:toast('info', '请先完成或取消当前导入。'); return end
             pick(cx, '连接另一台 Tern：选择邀请来源', {
                 { label = '粘贴完整邀请链接', detail = '在本机原生窗口中粘贴。', value = 'text' },
+                { label = '使用剪贴板中的二维码图片', detail = '仅读取这一次复制的图片，在本机识别。', value = 'clipboard' },
                 { label = '选择二维码图片', detail = '在本机离线识别 PNG / JPEG。', value = 'image' },
             }, chooseSource)
         end,

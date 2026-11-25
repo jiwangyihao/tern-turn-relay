@@ -120,6 +120,44 @@ static void imageTests(NSURL *dir) {
     CHECK(!decodeImage(dir, &status) && status == InvalidImage);
 }
 
+static void clipboardTests(NSURL *dir) {
+    // A unique pasteboard exercises the real AppKit API without touching the user's clipboard.
+    NSPasteboard *board = [NSPasteboard pasteboardWithUniqueName];
+    @try {
+        int status;
+        [board clearContents];
+        CHECK(!decodeClipboardImage(board, &status) && status == NoClipboardImage);
+        CHECK([board writeObjects:@[first]]);
+        CHECK(!decodeClipboardImage(board, &status) && status == NoClipboardImage);
+
+        NSData *png = [NSData dataWithContentsOfURL:writeFixture(dir, @"copy.png", @[first], 384, 384, NO, 1)];
+        NSData *jpeg = [NSData dataWithContentsOfURL:writeFixture(dir, @"copy.jpg", @[first], 384, 384, YES, 1)];
+        NSData *tiff = [NSBitmapImageRep imageRepWithData:png].TIFFRepresentation;
+        CHECK(png && jpeg && tiff);
+        for (NSArray *sample in @[@[NSPasteboardTypePNG, png], @[@"public.jpeg", jpeg], @[NSPasteboardTypeTIFF, tiff]]) {
+            NSPasteboardItem *item = [NSPasteboardItem new];
+            CHECK([item setData:sample[1] forType:sample[0]]);
+            CHECK([item setString:second forType:NSPasteboardTypeString]);
+            [board clearContents];
+            CHECK([board writeObjects:@[item]]);
+            NSInteger count = board.changeCount;
+            NSArray *decoded = decodeClipboardImage(board, &status);
+            CHECK([decoded isEqual:@[first]]); // ignore even valid invite text beside the bitmap
+            CHECK(submitCandidates(decoded, NoInvite, ^NSInteger(NSArray *titles) { CHECK(NO); return -1; },
+                ^BOOL(NSURL *url) { return [url.absoluteString isEqualToString:first]; }) == HandedOff);
+            CHECK(board.changeCount == count && [[board dataForType:sample[0]] isEqual:sample[1]]);
+        }
+
+        NSPasteboardItem *bad = [NSPasteboardItem new];
+        CHECK([bad setData:[@"not an image" dataUsingEncoding:NSUTF8StringEncoding] forType:NSPasteboardTypePNG]);
+        [board clearContents];
+        CHECK([board writeObjects:@[bad]]);
+        CHECK(!decodeClipboardImage(board, &status) && status == InvalidImage);
+    } @finally {
+        [board releaseGlobally];
+    }
+}
+
 static void routeTests(void) {
     for (NSString *raw in @[@"", other, @"https://pair?a=b", @"tern://pair.example", @"tern://user@pair?x",
             @"tern://pair@example.invalid?x", @"tern://pair:443", @"tern://pair:", @"tern://%70air", @"tern://pair/other",
@@ -175,7 +213,7 @@ int main(void) {
         NSURL *dir = [NSURL fileURLWithFileSystemRepresentation:path isDirectory:YES relativeToURL:nil];
         free(path);
         int result = 0;
-        @try { routeTests(); choiceTests(); imageTests(dir); }
+        @try { routeTests(); choiceTests(); imageTests(dir); clipboardTests(dir); }
         @catch (NSException *exception) {
             // Report only a test location, never URLs, code payloads or framework error text.
             fprintf(stderr, "macOS importer test failed (line %d)\n", [exception.userInfo[@"line"] intValue]);

@@ -10,7 +10,7 @@
 #include <unistd.h>
 
 enum { HandedOff, Cancelled, UnsupportedInvite, NoInvite, InvalidImage,
-       ImageTooLarge, DeliveryFailed, ImportFailed };
+       ImageTooLarge, DeliveryFailed, ImportFailed, NoClipboardImage };
 static const off_t maxBytes = 16 * 1024 * 1024;
 static const uint64_t maxDimension = 8192, maxPixels = 16 * 1024 * 1024;
 static NSString *const ternBundle = @"so.stencil.tern";
@@ -145,15 +145,18 @@ static NSData *readImage(NSURL *file, int *status) {
     return data;
 }
 
-static NSArray<NSString *> *decodeImage(NSURL *file, int *status) {
-    NSData *data = readImage(file, status);
-    if (!data) return nil;
+static NSArray<NSString *> *decodeImageData(NSData *data, BOOL allowTIFF, int *status) {
+    *status = InvalidImage;
+    if (!data.length) return nil;
+    if (data.length > (NSUInteger)maxBytes) { *status = ImageTooLarge; return nil; }
     NSDictionary *options = @{(__bridge NSString *)kCGImageSourceShouldCache: @NO};
     CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, (__bridge CFDictionaryRef)options);
     if (!source) return nil;
     NSString *type = (__bridge NSString *)CGImageSourceGetType(source);
     CGImageRef image = NULL;
-    if (([type isEqualToString:@"public.jpeg"] || [type isEqualToString:@"public.png"]) && CGImageSourceGetCount(source) == 1) {
+    BOOL supported = [type isEqualToString:@"public.jpeg"] || [type isEqualToString:@"public.png"] ||
+                     (allowTIFF && [type isEqualToString:@"public.tiff"]);
+    if (supported && CGImageSourceGetCount(source) == 1) {
         NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, (__bridge CFDictionaryRef)options));
         uint64_t w = [properties[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedLongLongValue];
         uint64_t h = [properties[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedLongLongValue];
@@ -184,6 +187,21 @@ static NSArray<NSString *> *decodeImage(NSURL *file, int *status) {
         if (code.payloadStringValue.length) [payloads addObject:code.payloadStringValue];
     }
     return payloads;
+}
+
+static NSArray<NSString *> *decodeImage(NSURL *file, int *status) {
+    NSData *data = readImage(file, status);
+    return data ? decodeImageData(data, NO, status) : nil;
+}
+
+static NSArray<NSString *> *decodeClipboardImage(NSPasteboard *board, int *status) {
+    // Ask for one encoded bitmap, not an NSImage, pasteboard text, HTML, or a URL.
+    // ImageIO can then check the byte/pixel budgets before decompressing it.
+    NSInteger snapshot = board.changeCount;
+    NSPasteboardType type = [board availableTypeFromArray:@[NSPasteboardTypePNG, @"public.jpeg", NSPasteboardTypeTIFF]];
+    NSData *data = type ? [board dataForType:type] : nil;
+    if (!data || board.changeCount != snapshot) { *status = NoClipboardImage; return nil; }
+    return decodeImageData(data, YES, status);
 }
 
 // Callbacks marshal results onto the main queue. Keep that queue running while
@@ -285,16 +303,19 @@ static int importText(void) {
                             ^BOOL(NSURL *url) { return handToTern(url); });
 }
 
-static int importImage(void) {
-    NSOpenPanel *panel = NSOpenPanel.openPanel;
-    panel.restorable = NO;
-    panel.title = @"Choose a Tern QR image";
-    panel.prompt = @"Import";
-    panel.canChooseDirectories = NO;
-    panel.allowsMultipleSelection = NO;
-    panel.allowedFileTypes = @[@"png", @"jpeg", @"jpg"];
-    if ([panel runModal] != NSModalResponseOK) return Cancelled;
-    NSURL *file = panel.URL;
+static int importImage(BOOL fromClipboard) {
+    NSURL *file = nil;
+    if (!fromClipboard) {
+        NSOpenPanel *panel = NSOpenPanel.openPanel;
+        panel.restorable = NO;
+        panel.title = @"Choose a Tern QR image";
+        panel.prompt = @"Import";
+        panel.canChooseDirectories = NO;
+        panel.allowsMultipleSelection = NO;
+        panel.allowedFileTypes = @[@"png", @"jpeg", @"jpg"];
+        if ([panel runModal] != NSModalResponseOK) return Cancelled;
+        file = panel.URL;
+    }
     __block NSArray *payloads;
     __block int status = ImportFailed;
     __block BOOL finished = NO;
@@ -302,7 +323,10 @@ static int importImage(void) {
         @autoreleasepool {
             int result = InvalidImage;
             NSArray *decoded = nil;
-            @try { decoded = decodeImage(file, &result); }
+            @try {
+                decoded = fromClipboard ? decodeClipboardImage(NSPasteboard.generalPasteboard, &result)
+                                        : decodeImage(file, &result);
+            }
             @catch (NSException *exception) { result = InvalidImage; }
             dispatch_async(dispatch_get_main_queue(), ^{ payloads = decoded; status = result; finished = YES; });
         }
@@ -315,7 +339,7 @@ static int importImage(void) {
 
 int tern_pair_import(int source) {
     @autoreleasepool {
-        if (![NSThread isMainThread] || (source != 0 && source != 1)) return ImportFailed;
+        if (![NSThread isMainThread] || source < 0 || source > 2) return ImportFailed;
         // Even malformed image decoders/framework diagnostics must not reach
         // the parent's stderr. This process exits immediately after this call.
         struct rlimit noCore = {0, 0};
@@ -329,7 +353,7 @@ int tern_pair_import(int source) {
             [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
             [NSApp finishLaunching];
             [NSApp activateIgnoringOtherApps:YES];
-            return source == 0 ? importText() : importImage();
+            return source == 0 ? importText() : importImage(source == 2);
         } @catch (NSException *exception) { return ImportFailed; }
     }
 }

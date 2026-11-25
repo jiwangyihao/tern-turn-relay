@@ -38,6 +38,7 @@ fn pair_import(args: &[String]) -> &'static str {
     let source = match source.as_str() {
         "text" => 0,
         "image" => 1,
+        "clipboard" => 2,
         _ => return "import-failed",
     };
     #[cfg(target_os = "macos")]
@@ -45,7 +46,7 @@ fn pair_import(args: &[String]) -> &'static str {
         extern "C" {
             fn tern_pair_import(source: std::ffi::c_int) -> std::ffi::c_int;
         }
-        // SAFETY: the linked importer accepts only the two selectors above,
+        // SAFETY: the linked importer accepts only the selectors above,
         // owns its UI and memory, and returns a small status, never a pointer.
         match unsafe { tern_pair_import(source) } {
             0 => "handed-off",
@@ -55,6 +56,7 @@ fn pair_import(args: &[String]) -> &'static str {
             4 => "invalid-image",
             5 => "image-too-large",
             6 => "delivery-failed",
+            8 => "no-clipboard-image",
             _ => "import-failed",
         }
     }
@@ -74,7 +76,7 @@ async fn dispatch(args: &[String]) -> Result<Option<Value>> {
             json!({"ok":true,"binary":std::env::current_exe().map_err(|_|Error::new("runtime-path","Cannot locate native executable."))?,"runtime_ready":true,"version":env!("CARGO_PKG_VERSION")}),
         )),
         Some("--help") if args.len() == 1 => Ok(Some(
-            json!({"ok":true,"usage":"tern-turn-relay relay|onboarding|credentials|install|remote COMMAND [OPTIONS]; macOS: pair-import text|image","secrets":"Only hidden native input, private files or stdin; never arguments."}),
+            json!({"ok":true,"usage":"tern-turn-relay relay|onboarding|credentials|install|remote COMMAND [OPTIONS]; macOS: pair-import text|image|clipboard","secrets":"Only hidden native input, private files or stdin; never arguments."}),
         )),
         Some("relay") => relay::run(&args[1..]).await.map(Some),
         Some("onboarding") => onboarding::run(&args[1..]).await.map(Some),

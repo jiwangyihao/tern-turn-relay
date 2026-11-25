@@ -99,6 +99,19 @@ function cases.unconfigured_remote_window_has_a_working_local_button_and_command
     assert(f.children[2].argv[6] == 'image')
 end
 
+function cases.clipboard_image_requires_explicit_selection_and_never_falls_back_to_text()
+    local f = window('macos', true)
+    f:command('pair-import')
+    assert(#f.children == 0)
+    f.picks[1].reply(nil, nil, f.cx); f:flush()
+    assert(#f.children == 0)
+    f:command('pair-import'); f:choose('clipboard')
+    local child = assert(f.children[1])
+    assert(child.stdinClosed and child.argv[5] == 'pair-import' and child.argv[6] == 'clipboard')
+    f:receipt(child, false, 'no-clipboard-image', 1)
+    assert(f.toasts[#f.toasts][3] == 'no-clipboard-image' and #f.children == 1 and next(f.writes) == nil)
+end
+
 function cases.only_macos_offers_pairing()
     for _, osName in ipairs({ 'linux', 'windows', 'ios' }) do
         local f = window(osName, true)
