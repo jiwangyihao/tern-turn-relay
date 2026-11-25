@@ -12,6 +12,7 @@ local CONNECT_MS = 45000
 local STARTUP_MS = 30000
 local HELPER_GRACE_MS = 2000
 local STATUS_TIMEOUT_MS = 15000
+local LABEL_TIMEOUT_MS = 5000
 local generation = 0
 local busy = nil
 local pending = nil
@@ -24,6 +25,7 @@ local stopAfterResume = false
 local alias = nil
 local nativeState = "disconnected"
 local lastError = nil
+local labelSaveFailed = false
 local cache = { state = "stopped", mode = nil, bytes_up = 0, bytes_down = 0, flows = 0, ssh_connections = 0,
     queued_packets = 0, queued_bytes = 0, queue_dropped_packets = 0, queue_dropped_bytes = 0, congested = false }
 local statusText = "TURN · 已停止"
@@ -494,6 +496,30 @@ local function sameTarget(value, config)
         and value.daemon_socket == config.daemonSocket and value.route_policy == "exclusive"
 end
 
+local function isEndpointName(host)
+    return host.name == "127.0.0.1" or host.name == host.address
+end
+
+-- hosts:add(address) reads the saved display name at add time; it cannot rename
+-- an attached Host. The controller validates current config before touching the record.
+local function saveHostLabel(token, config, create, preferred, callback)
+    local receipt = runner:wait(token, LABEL_TIMEOUT_MS + HELPER_GRACE_MS, function(result, fresh, timedOut)
+        local parsed, value = false, nil
+        if not timedOut and result and not result.timed_out and result.status == 0
+            and type(result.stdout) == "string" and #result.stdout <= MAX_JSON then
+            parsed, value = pcall(tern.json.decode, result.stdout)
+        end
+        callback(fresh, parsed and type(value) == "table" and value.ok == true and value.action == "host-label")
+    end)
+    local launched = pcall(function()
+        local argv = { "onboarding", "host-label", "--data-dir", tern.plugin.data, "--package-dir", tern.plugin.dir }
+        local input = { address = config.address, fingerprint = config.relayFingerprint, create = create, preferred = preferred }
+        tern.process.run(platform.bootstrap("--exec", argv), { stdin = tern.json.encode(input), timeout_ms = LABEL_TIMEOUT_MS },
+            function(result) receipt(result); runner:wake() end)
+    end)
+    if not launched then receipt(nil); runner:wake() end
+end
+
 local function originalAddress(cx, source, config)
     local t = config.target
     local key = "original-direct:" .. config.address .. ":" .. t.fingerprint
@@ -697,6 +723,12 @@ stepNative = function(cx, request)
             failNative(cx, "The exact TURN entry changed before detach; no replacement Host was removed.")
             return
         end
+        -- Only this verified TURN entry may contribute a custom name. Never
+        -- copy the current window's direct Host name onto the loopback entry.
+        if fingerprint == request.fingerprint and type(host.name) == "string" and host.name ~= ""
+            and not isEndpointName(host) and not host.name:find("%c") then
+            request.preferredName = host.name
+        end
         request.removingSource = host.id == request.source.id
         request.nativeError = nil
         queueNative(request, "observe-detached")
@@ -711,8 +743,38 @@ stepNative = function(cx, request)
         else
             queueNative(request, "observe-detached", 100)
         end
+    elseif phase == "wait-label" then
+        -- Independent lease: even an interrupted result hook must not stall add.
+        request.labelFailed = true
+        queueNative(request, "add")
     elseif phase == "add" then
         request.nativeError = nil
+        if request.action ~= "restore" then
+            local config = targetConfig(nil)
+            if not config or not sameTarget(cache, config) then
+                failNative(cx, "TURN configuration changed before native add; connection refused.")
+                return
+            end
+            if host and request.labelAttempted then
+                failNative(cx, "A replacement TURN entry appeared before native add; it was left untouched.")
+                return
+            end
+            if not host and not request.labelAttempted then
+                request.labelAttempted = true
+                -- A slow cosmetic write has its own bound; do not spend the
+                -- remaining transport deadline on it after a slow detach.
+                request.deadline += LABEL_TIMEOUT_MS + HELPER_GRACE_MS
+                queueNative(request, "wait-label", LABEL_TIMEOUT_MS + HELPER_GRACE_MS)
+                local ticket = request.ticket
+                saveHostLabel(request.token, config, true, request.preferredName, function(_fresh, saved)
+                    if pending ~= request or request.ticket ~= ticket then return end
+                    request.labelFailed = not saved
+                    queueNative(request, "add")
+                end)
+                return
+            end
+            if request.labelAttempted then labelSaveFailed = request.labelFailed end
+        end
         if host then queueNative(request, "observe-connected"); return end
         local attemptAddress = request.address
         local receipt = runner:wait(request.token, math.max(1, request.deadline - tern.now()),
@@ -945,18 +1007,31 @@ local function discoverStartup(cx, request, authoritative)
     end
     local value = request.status
     cancelStartup() -- One startup attempt; later ones follow watchBackend's backoff.
-    if value.state ~= "stopped" or not value.resume_mode then schedule(); return end
+    local resume = value.state == "stopped" and value.resume_mode ~= nil
+    local fingerprint = host.detail and host.detail.fingerprint
+    local repair = host.state == "connected" and isEndpointName(host) and fingerprint == request.config.relayFingerprint
+    if not resume and not repair then schedule(); return end
     local config = targetConfig(cx)
     if not config or not sameTarget(value, config) then
         if config then report(cx, "Startup configuration changed; recovery was refused.") end
         return
     end
-    local fingerprint = host.detail and host.detail.fingerprint
     if fingerprint and fingerprint ~= config.relayFingerprint then
         report(cx, "Startup Host fingerprint differs from the configured target; recovery was refused.")
         return
     end
-    resumeBackend(cx, request.token, value.resume_mode, config, false)
+    if repair then
+        local hostId = host.id
+        saveHostLabel(request.token, config, false, nil, function(fresh, saved)
+            if not fresh or not sameTarget(cache, config) then return end
+            local inspected, current = pcall(exactHost, fresh, config.address)
+            if not inspected or not current or current.id ~= hostId or current.state ~= "connected"
+                or not isEndpointName(current) or not current.detail or current.detail.fingerprint ~= config.relayFingerprint then return end
+            labelSaveFailed = not saved
+            refresh()
+        end)
+    end
+    if resume then resumeBackend(cx, request.token, value.resume_mode, config, false) else schedule() end
 end
 
 local function prepare(cx, allowLocal)
@@ -1051,7 +1126,8 @@ local function status(cx)
             runner:post(request.token, function(fresh) request.consume(nil, fresh, true) end)
         end
     end
-    if pending then queueNative(pending, pending.phase) end
+    -- The label receipt (or its bounded lease), never a Status click, releases add.
+    if pending and pending.phase ~= "wait-label" then queueNative(pending, pending.phase) end
     runner:wake()
     if busy then
         refresh()
@@ -1373,6 +1449,7 @@ local function cardRows(review, action, throughput)
         pair("流量", "↑" .. bytes(cache.bytes_up) .. " ↓" .. bytes(cache.bytes_down))
         local endpoint = cache.address and cache.address:match("@(.+)$")
         if endpoint then pair("入口", endpoint) end
+        if labelSaveFailed then pair("Host 名称", "未能保存显示名称；连接地址未变。", "warn") end
         if cache.queued_packets > 0 then pair("排队", string.format("%d 包 · %s", cache.queued_packets, bytes(cache.queued_bytes))) end
         if cache.queue_dropped_packets > 0 then pair("上行丢弃", string.format("%d 包", cache.queue_dropped_packets), "warn") end
         if (cache.downlink_dropped_packets or 0) > 0 then pair("下行丢弃", string.format("%d 包", cache.downlink_dropped_packets), "warn") end

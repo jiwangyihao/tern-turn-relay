@@ -10,6 +10,17 @@ end
 
 local function fixture(os, configured, installed, kv)
     local f = { calls = {}, commands = {}, timers = {}, time = 0, mutations = 0, toasts = {}, details = '', hosts = {}, reads = {}, kv = kv or {}, widgets = {}, events = {}, sheets = {} }
+    f.labelCalls, f.savedNames = {}, {}
+    function f:finishLabel(call, success)
+        local input = call.input
+        if success and (input.create or self.savedNames[input.address] ~= nil) then
+            local previous = self.savedNames[input.address]
+            if previous == nil or previous == '' or previous == '127.0.0.1' or previous == self.config.target.name then
+                self.savedNames[input.address] = input.preferred or self.config.target.name
+            end
+        end
+        call.callback({ stdout = 'host-label-result', status = success and 0 or 1 }, { expired = true })
+    end
     f.config = { schema = 4, ssh_destination = 'server', listen_port = 18377,
         target = { name = 'server', host = '203.0.113.1', user = 'user', port = 22, fingerprint = 'original-pin' },
         gateway = { fingerprint = 'relay-pin', daemon_socket = '/private/daemon.sock' } }
@@ -49,9 +60,20 @@ local function fixture(os, configured, installed, kv)
             end
             if raw == 'config' then return f.config end
             if raw == 'stale-status' then return f:value('ready') end
+            if raw == 'host-label-result' then return { ok = true, action = 'host-label' } end
             return f.response
         end },
-        process = { run = function(argv, options, callback) table.insert(f.calls, { argv = argv, options = options, callback = callback }) end },
+        process = { run = function(argv, options, callback)
+            local offset = os == 'windows' and 10 or 4
+            if argv[offset + 1] == 'onboarding' and argv[offset + 2] == 'host-label' then
+                local input = options.stdin
+                local call = { argv = argv, input = input, callback = callback }
+                table.insert(f.labelCalls, call)
+                if not f.holdLabel then f:finishLabel(call, true) end
+            else
+                table.insert(f.calls, { argv = argv, options = options, callback = callback })
+            end
+        end },
         kv = { get = function(key) return f.kv[key] end, set = function(key, value) f.kv[key] = value end },
         on = function(name, handler) f.events[name] = handler end,
         css = function(name, source) f.sheets[name] = source end,
@@ -416,6 +438,7 @@ function cases.clean_restore_revokes_auto_recovery_only_after_alias_detaches()
         local before = #f.calls
         f:command('restore-direct')
         assert(current.id == 'direct', 'restore must switch to the original direct Host')
+        assert(#f.labelCalls == 0, 'restoring a direct address never saves a TURN label')
         local released = false
         for index = before + 1, #f.calls do
             if f.calls[index].argv[6] == 'release' then released = true end
@@ -628,6 +651,7 @@ local function liveHosts(f, current)
                 log.adds += 1
                 table.insert(log.addTimes, self.time)
                 local host = { kind = 'remote', id = 'relay-' .. log.adds, address = address,
+                    name = self.savedNames[address] or '127.0.0.1',
                     state = log.addState or 'connected', detail = { fingerprint = 'relay-pin' } }
                 table.insert(self.hosts, host)
                 return { next = function(_, callback)
@@ -640,7 +664,13 @@ local function liveHosts(f, current)
             end,
             disconnect = function(_, id)
                 log.disconnects += 1
-                for index, host in ipairs(self.hosts) do if host.id == id then table.remove(self.hosts, index); break end end
+                for index, host in ipairs(self.hosts) do
+                    if host.id == id then
+                        self.savedNames[host.address] = nil
+                        table.remove(self.hosts, index)
+                        break
+                    end
+                end
             end,
             trust = function() error('a pinned entry is never re-trusted') end,
         }
@@ -651,6 +681,115 @@ end
 
 local function aliasHost(state)
     return { kind = 'remote', id = 'relay', address = 'user@127.0.0.1:18377', state = state, detail = { fingerprint = 'relay-pin' } }
+end
+
+function cases.convert_names_the_native_host_before_add_without_copying_the_direct_label()
+    for _, os in ipairs({ 'macos', 'windows' }) do
+        local f = fixture(os, true, true)
+        f.config.target.name = 'wawa-dev'
+        local direct = { kind = 'remote', id = 'direct', address = 'user@203.0.113.1:22', name = 'Direct only',
+            state = 'connected', detail = { fingerprint = 'original-pin' } }
+        f.hosts = { direct }
+        local log = liveHosts(f, direct)
+        f:complete(f:value('stopped'))
+        f:command('convert-tls')
+        f.holdLabel = true
+        f:complete(f:value('ready', 'tls'))
+        assert(log.adds == 0 and #f.labelCalls == 1, 'add must wait for the saved-host result')
+        local call = f.labelCalls[1]
+        local offset = os == 'windows' and 10 or 4
+        local prefix = os == 'windows' and 'C:/用户/' or '/Users/用户/'
+        assert(call.argv[offset] == '--exec' and call.argv[offset + 3] == '--data-dir'
+            and call.argv[offset + 4] == prefix .. 'data' and call.argv[offset + 5] == '--package-dir'
+            and call.argv[offset + 6] == prefix .. 'plugin')
+        assert(call.input.address == 'user@127.0.0.1:18377' and call.input.fingerprint == 'relay-pin'
+            and call.input.create == true and call.input.preferred == nil)
+        f:finishLabel(call, true); f:flush()
+        assert(log.adds == 1 and f.hosts[2].address == 'user@127.0.0.1:18377' and f.hosts[2].name == 'wawa-dev')
+    end
+end
+
+function cases.manual_reconnect_preserves_only_an_identified_turn_hosts_custom_name()
+    for _, verified in ipairs({ true, false }) do
+        local f = fixture('macos', true, true)
+        local host = aliasHost('failed')
+        host.name = 'My lab'
+        f.savedNames[host.address] = 'server'
+        if not verified then host.detail = {} end
+        f.hosts = { host }
+        local log = liveHosts(f, host)
+        f:complete(f:value('ready', 'tls'))
+        f:command('reconnect')
+        assert(log.disconnects == 1 and log.adds == 1 and #f.hosts == 1)
+        assert(f.hosts[1].name == (verified and 'My lab' or 'server'))
+    end
+end
+
+function cases.startup_repairs_only_the_saved_name_of_a_live_verified_loopback_host()
+    for _, scenario in ipairs({ 'legacy', 'full address', 'absent', 'wrong pin', 'custom', 'unrelated' }) do
+        local f = fixture('macos', true, true)
+        local host = aliasHost('connected')
+        local liveName = scenario == 'custom' and 'User label' or (scenario == 'full address' and host.address or '127.0.0.1')
+        host.name = liveName
+        if scenario == 'wrong pin' then host.detail.fingerprint = 'another pin' end
+        if scenario == 'unrelated' then host.address = 'user@127.0.0.1:18378' end
+        local saved = scenario ~= 'absent' and '' or nil
+        f.savedNames[host.address] = saved
+        f.hosts = { host }
+        f:complete(f:value('ready', 'tls'))
+        f.time = 3000; f:flush(); f:complete(f:value('ready', 'tls'))
+        local repair = scenario == 'legacy' or scenario == 'full address' or scenario == 'absent'
+        assert(#f.labelCalls == (repair and 1 or 0), 'repair is once per discovery, not every poll: ' .. scenario)
+        if repair then assert(f.labelCalls[1].input.create == false) end
+        assert(f.savedNames[host.address] == (repair and saved ~= nil and 'server' or saved))
+        assert(f.mutations == 0 and host.name == liveName)
+    end
+end
+
+function cases.label_completion_cannot_add_after_stop_or_a_changed_host_or_identity()
+    for _, scenario in ipairs({ 'stop', 'focus', 'config', 'replacement' }) do
+        local f = fixture('macos', true, true)
+        local old = aliasHost('failed')
+        local other = { kind = 'remote', id = 'other', address = 'user@elsewhere' }
+        f.hosts = { old, other }
+        local log = liveHosts(f, old)
+        f:complete(f:value('ready', 'tls'))
+        f.holdLabel = true
+        f:command('reconnect')
+        assert(log.disconnects == 1 and log.adds == 0)
+        if scenario == 'stop' then f:command('disconnect')
+        elseif scenario == 'focus' then f:context().hosts:switch(other.id)
+        elseif scenario == 'config' then f.config.gateway.fingerprint = 'changed'
+        else table.insert(f.hosts, aliasHost('connected')) end
+        f:finishLabel(f.labelCalls[1], true); f:flush()
+        assert(log.adds == 0 and log.disconnects == 1 and log.switches == (scenario == 'focus' and 1 or 0))
+    end
+end
+
+function cases.failed_or_missing_label_receipt_keeps_the_connection_and_exposes_a_nonfatal_warning()
+    for _, scenario in ipairs({ 'failed', 'timeout' }) do
+        local f = fixture('macos', true, true)
+        local old = aliasHost('failed')
+        f.hosts = { old }
+        local log = liveHosts(f, old)
+        f:complete(f:value('ready', 'tls'))
+        f.holdLabel = true
+        f:command('reconnect')
+        if scenario == 'timeout' then
+            f:command('status')
+            f:complete(f:value('ready', 'tls'))
+            assert(log.adds == 0 and #f.labelCalls == 1, 'Status must not bypass or restart the pending save')
+            f.time = 10000; f:flush()
+        else
+            f:finishLabel(f.labelCalls[1], false); f:flush()
+        end
+        assert(log.adds == 1 and f.hosts[1].state == 'connected')
+        assert(cardRow(f, 'label', 'Host 名称').tone == 'warn' and f:view().tone ~= 'error')
+        if scenario == 'timeout' then
+            f:finishLabel(f.labelCalls[1], true); f:flush()
+            assert(log.adds == 1 and f.hosts[1].name == '127.0.0.1', 'a late save cannot rename or re-add a live entry')
+        end
+    end
 end
 
 -- One poll interval: answer the status query only when the plugin actually made one (a
@@ -678,6 +817,7 @@ function cases.stalled_entry_is_reattached_in_the_background_after_a_grace_perio
         'after 20 s the stalled entry is detached and the same address re-added')
     assert(log.switches == 0, 'a window showing another Host is not moved')
     assert(#f.hosts == 1 and f.hosts[1].address == 'user@127.0.0.1:18377' and f.hosts[1].state == 'connected')
+    assert(f.hosts[1].name == 'server', 'automatic recovery also resolves the label before add')
     assert(f:view().text ~= '卡住')
 end
 

@@ -994,6 +994,14 @@ pub fn unix_time() -> f64 {
         .unwrap_or_default()
         .as_secs_f64()
 }
+pub(crate) fn relay_address(config: &Value) -> String {
+    format!(
+        "{}@127.0.0.1:{}",
+        config["target"]["user"].as_str().unwrap_or(""),
+        config["listen_port"].as_u64().unwrap_or(0)
+    )
+}
+
 pub fn public_status(
     config: Option<&Value>,
     state: &str,
@@ -1001,13 +1009,7 @@ pub fn public_status(
     service_id: Option<&str>,
     error: Option<&str>,
 ) -> Value {
-    let address = config.map(|c| {
-        format!(
-            "{}@127.0.0.1:{}",
-            c["target"]["user"].as_str().unwrap_or(""),
-            c["listen_port"].as_u64().unwrap_or(0)
-        )
-    });
+    let address = config.map(relay_address);
     json!({"ok":state!="error","state":state,"mode":mode,"address":address,"target":config.map(|c|c["target"].clone()),"ssh_destination":config.map(|c|c["ssh_destination"].clone()),"relay_fingerprint":config.map(|c|c["gateway"]["fingerprint"].clone()),"daemon_socket":config.map(|c|c["gateway"]["daemon_socket"].clone()),"route_policy":"exclusive","ssh_connections":0,"queue_dropped_packets":0,"queue_dropped_bytes":0,"queued_packets":0,"queued_bytes":0,"congested":false,"bytes_up":0,"bytes_down":0,"flows":0,"error":error,"service_id":service_id,"credentials_expires_at":null})
 }
 

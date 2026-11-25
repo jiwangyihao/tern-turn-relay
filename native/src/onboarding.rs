@@ -396,12 +396,48 @@ async fn rebind(paths: &Paths, request: &Value, apply: bool) -> Result<Value> {
             "Preserve gateway certificates, credentials, SSH configuration and running programs; do not connect automatically."]}))
     }
 }
+fn host_label(paths: &Paths, request: &Value) -> Result<Value> {
+    fields(
+        request,
+        &["address", "fingerprint", "create", "preferred"],
+        &["address", "fingerprint", "create"],
+    )?;
+    let create = boolean(request, "create")?;
+    let config = install::current(paths)?.ok_or_else(request_error)?;
+    let address = common::relay_address(&config);
+    if request["address"].as_str() != Some(address.as_str())
+        || request["fingerprint"] != config["gateway"]["fingerprint"]
+    {
+        return Err(Error::new(
+            "identity-mismatch",
+            "Host label does not match the configured TURN endpoint.",
+        ));
+    }
+    let default = config["target"]["name"].as_str().ok_or_else(request_error)?;
+    let label = match request.get("preferred") {
+        None => default,
+        Some(value) => {
+            let name = value.as_str().ok_or_else(request_error)?;
+            if name.trim().is_empty()
+                || name.len() > 256
+                || name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+            {
+                return Err(request_error());
+            }
+            if name.trim() == address || name.trim() == "127.0.0.1" { default } else { name }
+        }
+    };
+    let changed = install::set_host_label(paths, &address, default, label, create)?;
+    Ok(json!({"changed":changed}))
+}
+
 async fn execute(action: &str, paths: &Paths, request: &Value) -> Result<Value> {
     match action {
         "inspect" => {
             fields(request, &[], &[])?;
             inspect(paths)
         }
+        "host-label" => host_label(paths, request),
         "discover" | "review" => discover(paths, request).await,
         "rebind-review" => rebind(paths, request, false).await,
         "rebind-apply" => rebind(paths, request, true).await,
@@ -536,6 +572,98 @@ mod tests {
     fn remote() -> Value {
         json!({"home":"/home/example","original_state_dir":"/home/example/original","daemon_socket":"/home/example/daemon.sock",
             "host":"8.8.8.8","user":"example","fingerprint":"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","target_port":8377})
+    }
+    #[tokio::test]
+    async fn host_label_only_updates_the_exact_configured_profile_entry() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        #[cfg(windows)]
+        let base = crate::windows_security::normalize_system_path(&base).unwrap();
+        let profile = base.join(format!("tern-label-test-{:032x}", rand::random::<u128>()));
+        let data = profile.join("plugin-data").join(install::PLUGIN);
+        let paths = Paths {
+            package: profile.join("plugins").join(install::PLUGIN),
+            ssh: data.join("ssh-config"),
+            aliases: profile.join("aliases"),
+            data,
+            profile,
+            tern: None,
+        };
+        let (mut config, _) = configuration(&paths, None, "wawa-dev", 18377, &remote(), "machine").unwrap();
+        let pin = "SHA256:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+        config["gateway"]["fingerprint"] = json!(pin);
+        install::replace(&paths.config(), None, Some(&serde_json::to_vec(&config).unwrap()), 0o600).unwrap();
+        let address = "example@127.0.0.1:18377";
+        let mut request = json!({"address":address,"fingerprint":pin,"create":false});
+        let hosts = paths.profile.join("hosts");
+        execute("host-label", &paths, &request).await.unwrap();
+        assert!(!hosts.exists());
+
+        request["create"] = json!(true);
+        for (field, invalid) in [
+            ("address", "example@127.0.0.1:18378"),
+            ("fingerprint", config["target"]["fingerprint"].as_str().unwrap()),
+            ("preferred", "name\nother@server"),
+            ("preferred", "name\rother"),
+            ("preferred", "name\talias"),
+            ("preferred", "name\0suffix"),
+        ] {
+            let mut bad = request.clone();
+            bad[field] = json!(invalid);
+            assert!(execute("host-label", &paths, &bad).await.is_err());
+            assert!(!hosts.exists());
+        }
+        execute("host-label", &paths, &request).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), format!("{address}\twawa-dev\n"));
+
+        std::fs::write(&hosts, "").unwrap();
+        execute("host-label", &paths, &request).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), format!("{address}\twawa-dev\n"));
+        std::fs::write(&hosts, format!("{address}\t127.0.0.1\r\n# keep")).unwrap();
+        execute("host-label", &paths, &request).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), format!("{address}\twawa-dev\r\n# keep"));
+
+        // Tern can keep a live Rename in memory while the saved entry still
+        // contains the configured default. A verified reconnect carries it over.
+        request["preferred"] = json!("工作站 A");
+        let renamed = execute("host-label", &paths, &request).await.unwrap();
+        assert_eq!(renamed["changed"], true);
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), format!("{address}\t工作站 A\r\n# keep"));
+
+        request["create"] = json!(false);
+        request["preferred"] = json!("工作站 A");
+        let explicit_name = format!("{address}\t{address}\r\n");
+        std::fs::write(&hosts, &explicit_name).unwrap();
+        let result = execute("host-label", &paths, &request).await.unwrap();
+        assert_eq!(result["changed"], false);
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), explicit_name);
+        let unrelated = "# keep\r\nexample@127.0.0.1:183770\tother\r\n";
+        std::fs::write(&hosts, unrelated).unwrap();
+        execute("host-label", &paths, &request).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), unrelated);
+        let original = format!("{unrelated}{address}");
+        std::fs::write(&hosts, &original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        execute("host-label", &paths, &request).await.unwrap();
+        let named = format!("{original}\t工作站 A");
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), named);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&hosts).unwrap().permissions().mode() & 0o777, 0o640);
+        }
+        request["preferred"] = json!("another label");
+        execute("host-label", &paths, &request).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), named);
+
+        let duplicate = format!("{named}\r\n{address}\r\n");
+        std::fs::write(&hosts, &duplicate).unwrap();
+        assert!(execute("host-label", &paths, &request).await.is_err());
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), duplicate);
+        std::fs::remove_dir_all(paths.profile).unwrap();
     }
     #[test]
     fn consent_never_accepts_truthy_values() {

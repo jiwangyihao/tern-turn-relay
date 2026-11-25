@@ -335,7 +335,9 @@ pub(crate) fn replace(
         if snapshot_at(&directory, &name, limit)?.as_ref() != expected {
             return Err(changed());
         }
-        if unsafe {
+        if expected.is_none() {
+            rename_no_replace(&directory, &temp, &directory, &name)?;
+        } else if unsafe {
             libc::renameat(
                 directory.as_raw_fd(),
                 temp.as_ptr(),
@@ -674,6 +676,61 @@ pub(crate) fn current(paths: &Paths) -> Result<Option<Value>> {
     }
     Ok(Some(common::load_config(&paths.config(), false)?))
 }
+
+/// Update only the selected profile's exact address record. Tern reads its optional
+/// tab-separated label at Host creation; other records belong to Tern and its user.
+pub(crate) fn set_host_label(paths: &Paths, address: &str, default: &str, label: &str, create: bool) -> Result<bool> {
+    const LIMIT: usize = 1024 * 1024;
+    let invalid = || Error::new("invalid-hosts", "The profile hosts file cannot be safely updated.");
+    let path = paths.profile.join("hosts");
+    let before = snapshot(&path, LIMIT)?;
+    let bytes = before.as_ref().map_or(&[][..], |s| s.bytes.as_slice());
+    let hosts = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+    let mut entry = None;
+    let mut offset = 0;
+    let mut eol = "\n";
+    for line in hosts.split_inclusive('\n') {
+        let record = if let Some(record) = line.strip_suffix("\r\n") {
+            eol = "\r\n";
+            record
+        } else if let Some(record) = line.strip_suffix('\n') {
+            eol = "\n";
+            record
+        } else {
+            line
+        };
+        if record.contains(['\0', '\r']) {
+            return Err(invalid());
+        }
+        let (key, name) = record.split_once('\t').unwrap_or((record, ""));
+        if key.trim() == address {
+            if key != address || entry.is_some() {
+                return Err(invalid());
+            }
+            entry = Some((offset, offset + record.len(), name.trim()));
+        }
+        offset += line.len();
+    }
+    let updated = match entry {
+        // A verified live Rename can be newer than our saved default. A
+        // different explicit name on disk belongs to the user; never replace it.
+        Some((_, _, name)) if name == label || (!name.is_empty() && name != "127.0.0.1" && name != default) => return Ok(false),
+        Some((start, end, _)) => [&hosts[..start], address, "\t", label, &hosts[end..]].concat(),
+        None if !create => return Ok(false),
+        None => {
+            let terminated = hosts.is_empty() || hosts.ends_with('\n');
+            let (before_record, after_record) = if terminated { ("", eol) } else { (eol, "") };
+            [hosts, before_record, address, "\t", label, after_record].concat()
+        }
+    };
+    if updated.len() > LIMIT {
+        return Err(invalid());
+    }
+    let mode = before.as_ref().map_or(0o600, |s| s.mode);
+    replace(&path, before.as_ref(), Some(updated.as_bytes()), mode)?;
+    Ok(true)
+}
+
 pub(crate) fn lifecycle(paths: &Paths) -> Result<(File, File)> {
     #[cfg(unix)]
     common::private_dir(&paths.data, true)?;
