@@ -1,6 +1,7 @@
 local function install(tern)
 -- Window-only: startup and polling may resume an explicitly selected backend, never a native connection.
 local platform = require('./platform').new(tern.runtime, tern.plugin, tern.getenv)
+local pairImport = tern.runtime.os == "macos" and require('./pair-import').new(tern, platform) or nil
 local configPath = tern.plugin.data .. "/config.json"
 local stateDir = tern.plugin.data .. "/runtime"
 local MAX_JSON = 16384
@@ -1229,6 +1230,9 @@ onboarding = require('./onboarding').new({
 }, tern)
 tern.command({ id = "setup", title = "Settings: server, Cloudflare Key and private runtime", group = "TURN",
     run = commandTick(function(cx) onboarding.open(cx) end) })
+if pairImport then
+    tern.command({ id = "pair-import", title = "连接另一台 Tern…", group = "TURN", run = pairImport.open })
+end
 
 tern.command({ id = "convert-tls", title = "Connect configured Host via TURN TLS", group = "TURN",
     run = commandTick(function(cx) if hasConfig then convert("tls", cx, true) else report(cx, "请先显式打开 TURN Settings 完成配置；未改变 Host。") end end) })
@@ -1647,6 +1651,7 @@ local function detailsHead(name, meta, badge, tone)
         viewNode("row", { gap = "md", align = "center", wrap = true }, {
             viewNode("text", { spans = fact(meta, "muted") }),
             viewNode("button", { key = "refresh", text = "刷新", icon = "repeat", variant = "quiet", actions = { click = "refresh" } }),
+            pairImport and viewNode("button", { key = "pair-import", text = "连接另一台 Tern…", actions = { click = "pair-import" } }),
         }),
     })
 end
@@ -1833,6 +1838,7 @@ end
 local DETAILS_ACTIONS = {
     refresh = commandTick(status),
     setup = commandTick(function(cx) onboarding.open(cx) end),
+    ["pair-import"] = pairImport and pairImport.open,
 }
 pcall(tern.on, "canvas_action", function(ev, cx)
     local run = type(ev) == "table" and ev.about == DETAILS_ABOUT and DETAILS_ACTIONS[ev.act]
@@ -1928,6 +1934,7 @@ for _, event in ipairs({ "focus", "command_finished", "cwd", "title" }) do
 end
 pcall(tern.on, "budget", function(ev) if type(ev) == "table" and ev.state == "resumed" then revive() end end)
 pcall(tern.on, "unload", function()
+    if pairImport then pairImport.unload() end
     if rtt.unsaved > 0 then saveSamples(rtt, RTT_KV) end
     if rate.unsaved > 0 then saveSamples(rate, RATE_KV) end
 end)

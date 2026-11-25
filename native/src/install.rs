@@ -23,6 +23,7 @@ const PACKAGE_FILES: &[&str] = &[
     "plugin.toml",
     "window.luau",
     "onboarding.luau",
+    "pair-import.luau",
     "work-queue.luau",
     "bootstrap-runtime.sh",
     "bootstrap-runtime.ps1",

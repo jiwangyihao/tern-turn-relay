@@ -3,6 +3,7 @@ local suites = {
     require('./platform_spec'),
     require('./onboarding_spec'),
     require('./window_spec'),
+    require('./pair_import_spec'),
 }
 local total = 0
 for _, suite in ipairs(suites) do total += suite.run() end

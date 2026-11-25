@@ -52,6 +52,10 @@ class ReleaseTests(unittest.TestCase):
             (package / 'native/Cargo.toml').write_text('version = "0.5.24"\n')
             (package / 'native/Cargo.lock').write_text('version = 4\n')
             (package / 'native/src/main.rs').write_text('fn main() {}\n')
+            for name in ('native/build.rs','native/src/pair_import.m','tests/pair_import_macos.m'):
+                target=package/name
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_bytes((release.ROOT/name).read_bytes())
             (package / 'tools').mkdir()
             (package / 'tools/release.py').write_bytes(Path(release.__file__).read_bytes())
             (package / '.github/workflows').mkdir(parents=True)
@@ -67,6 +71,7 @@ class ReleaseTests(unittest.TestCase):
                 with tarfile.open(root / 'out/tern-turn-relay-0.5.24.tar.gz') as archive:
                     names = {Path(name).relative_to('tern-turn-relay-0.5.24').as_posix() for name in archive.getnames()}
                     self.assertTrue(set(release.RUNTIME_FILES).issubset(names))
+                    self.assertTrue({'native/build.rs','native/src/pair_import.m','tests/pair_import_macos.m'}.issubset(names))
                     manifest = json.load(archive.extractfile('tern-turn-relay-0.5.24/release.json'))
                     self.assertIn('tern-turn-relay-windows-x86_64.exe', manifest['assets'])
                 value = json.loads((package / 'release.json').read_text())

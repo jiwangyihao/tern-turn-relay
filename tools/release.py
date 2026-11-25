@@ -3,7 +3,7 @@
 import argparse,gzip,hashlib,io,json,os,re,shutil,stat,subprocess,tarfile,tempfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
-RUNTIME_FILES=('plugin.toml','window.luau','card.css','onboarding.luau','work-queue.luau','platform.luau','bootstrap-runtime.sh','bootstrap-runtime.ps1','release.json','LICENSE','THIRD_PARTY_NOTICES.txt','README.md','CHANGELOG.md','docs/agent-setup.md')
+RUNTIME_FILES=('plugin.toml','window.luau','card.css','onboarding.luau','pair-import.luau','work-queue.luau','platform.luau','bootstrap-runtime.sh','bootstrap-runtime.ps1','release.json','LICENSE','THIRD_PARTY_NOTICES.txt','README.md','CHANGELOG.md','docs/agent-setup.md')
 ASSET_TARGETS={
     'tern-turn-relay-darwin-arm64':('aarch64-apple-darwin','macos','aarch64'),
     'tern-turn-relay-darwin-x86_64':('x86_64-apple-darwin','macos','x86_64'),
@@ -84,9 +84,9 @@ def manifest(directory,destination):
     destination.write_text(json.dumps({'schema':1,'version':version(),'assets':assets},indent=2)+'\n',encoding='utf-8',newline='\n')
 
 def package(destination,assets_directory):
-    files=list(RUNTIME_FILES)+['native/Cargo.toml','native/Cargo.lock','tools/release.py','.github/workflows/verify.yml']
+    files=list(RUNTIME_FILES)+['native/Cargo.toml','native/Cargo.lock','native/build.rs','native/src/pair_import.m','tools/release.py','.github/workflows/verify.yml']
     files.extend(path.relative_to(ROOT).as_posix() for path in sorted((ROOT/'native/src').rglob('*.rs')))
-    files.extend(path.relative_to(ROOT).as_posix() for path in sorted((ROOT/'tests').rglob('*')) if path.is_file() and path.suffix in ('.py','.luau','.ps1'))
+    files.extend(path.relative_to(ROOT).as_posix() for path in sorted((ROOT/'tests').rglob('*')) if path.is_file() and path.suffix in ('.py','.luau','.ps1','.m'))
     contents={}
     for name in files:
         path=ROOT/name;info=path.lstat()
@@ -121,6 +121,8 @@ def smoke(binary):
         return result.returncode,json.loads(result.stdout)
     code,value=invoke(['--version']);assert code==0 and value['runtime']=='rust' and value['version']==version()
     code,value=invoke(['--help']);assert code==0 and value.get('ok') is True and isinstance(value.get('usage'),str)
+    code,value=invoke(['pair-import','not-a-source','DO_NOT_ECHO_PRIVATE_ARGUMENT'])
+    assert code!=0 and value=={'ok':False,'code':'import-failed'},'Invalid pairing input must not open a window or echo its arguments'
     code,value=invoke(['credentials','not-a-command','DO_NOT_ECHO_PRIVATE_ARGUMENT']);assert code!=0 and 'DO_NOT_ECHO_PRIVATE_ARGUMENT' not in json.dumps(value)
     with tempfile.TemporaryDirectory(prefix='native-release-smoke-') as temporary:
         root=Path(temporary).resolve();root.chmod(0o700)

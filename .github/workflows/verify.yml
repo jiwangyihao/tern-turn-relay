@@ -72,6 +72,14 @@ jobs:
         run: python -m unittest discover -s tests -p "test_*.py"
       - name: Rust 行为测试
         run: cargo test --locked --manifest-path native/Cargo.toml --target ${{ matrix.target }}
+      - name: macOS 离线二维码与邀请导入
+        if: runner.os == 'macOS'
+        run: |
+          xcrun clang -fobjc-arc -fblocks tests/pair_import_macos.m \
+            -framework AppKit -framework Foundation -framework Vision -framework ImageIO \
+            -framework CoreGraphics -framework CoreFoundation -framework CoreImage \
+            -o "$RUNNER_TEMP/pair-import-tests"
+          "$RUNNER_TEMP/pair-import-tests"
       - name: 构建发行程序
         run: cargo build --release --locked --manifest-path native/Cargo.toml --target ${{ matrix.target }}
       - name: 运行实际二进制

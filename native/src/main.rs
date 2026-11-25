@@ -31,6 +31,40 @@ fn emit(value: &Value) {
     let _ = stdout.write_all(b"\n");
     let _ = stdout.flush();
 }
+// Run AppKit on the process main thread, not a Tokio worker. The CLI only
+// accepts the source selector; invite text and decoded images stay in AppKit.
+fn pair_import(args: &[String]) -> &'static str {
+    let [source] = args else { return "import-failed" };
+    let source = match source.as_str() {
+        "text" => 0,
+        "image" => 1,
+        _ => return "import-failed",
+    };
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn tern_pair_import(source: std::ffi::c_int) -> std::ffi::c_int;
+        }
+        // SAFETY: the linked importer accepts only the two selectors above,
+        // owns its UI and memory, and returns a small status, never a pointer.
+        match unsafe { tern_pair_import(source) } {
+            0 => "handed-off",
+            1 => "cancelled",
+            2 => "unsupported-invite",
+            3 => "no-invite",
+            4 => "invalid-image",
+            5 => "image-too-large",
+            6 => "delivery-failed",
+            _ => "import-failed",
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = source;
+        "unsupported-platform"
+    }
+}
+
 async fn dispatch(args: &[String]) -> Result<Option<Value>> {
     match args.first().map(String::as_str) {
         Some("--version") if args.len() == 1 => Ok(Some(
@@ -40,7 +74,7 @@ async fn dispatch(args: &[String]) -> Result<Option<Value>> {
             json!({"ok":true,"binary":std::env::current_exe().map_err(|_|Error::new("runtime-path","Cannot locate native executable."))?,"runtime_ready":true,"version":env!("CARGO_PKG_VERSION")}),
         )),
         Some("--help") if args.len() == 1 => Ok(Some(
-            json!({"ok":true,"usage":"tern-turn-relay relay|onboarding|credentials|install|remote COMMAND [OPTIONS]","secrets":"Only hidden native input, private files or stdin; never arguments."}),
+            json!({"ok":true,"usage":"tern-turn-relay relay|onboarding|credentials|install|remote COMMAND [OPTIONS]; macOS: pair-import text|image","secrets":"Only hidden native input, private files or stdin; never arguments."}),
         )),
         Some("relay") => relay::run(&args[1..]).await.map(Some),
         Some("onboarding") => onboarding::run(&args[1..]).await.map(Some),
@@ -70,6 +104,12 @@ fn main() {
     // Never expose request values or credentials through a panic hook.
     std::panic::set_hook(Box::new(|_| {}));
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("pair-import") {
+        let code = pair_import(&args[1..]);
+        let ok = matches!(code, "handed-off" | "cancelled");
+        emit(&json!({"ok":ok,"code":code}));
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
